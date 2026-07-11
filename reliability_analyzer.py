@@ -481,7 +481,7 @@ def stats_text(model, col):
 # ============================================================================
 # 5. PDF 출력 (Line 1×4 / Box 4×3, A4 Landscape, 마지막 페이지 크기 유지)
 # ============================================================================
-PPT_PORTRAIT = (7.5, 13.33)  # 16:9 PPT 슬라이드 세로 방향
+PPT_LANDSCAPE = (13.33, 7.5)  # 16:9 PPT 슬라이드 가로 방향
 
 
 def export_pdf(model, cols, path, progress_cb=None):
@@ -491,7 +491,7 @@ def export_pdf(model, cols, path, progress_cb=None):
         title = f"{model.reliability}_{model.lot} Data Analysis"
         # Line Graph: 1페이지 1열 x 3줄
         for i in range(0, len(cols), 3):
-            fig = Figure(figsize=PPT_PORTRAIT)
+            fig = Figure(figsize=PPT_LANDSCAPE)
             fig.suptitle(title, fontsize=12)
             for k in range(3):  # 마지막 페이지도 3칸 유지 → 동일 크기
                 ax = fig.add_subplot(3, 1, k + 1)
@@ -506,7 +506,7 @@ def export_pdf(model, cols, path, progress_cb=None):
                 progress_cb(done, total)
         # Box Plot: 1페이지 3개 x 3줄 (통계 텍스트 공간 확보)
         for i in range(0, len(cols), 9):
-            fig = Figure(figsize=PPT_PORTRAIT)
+            fig = Figure(figsize=PPT_LANDSCAPE)
             fig.suptitle(title, fontsize=12)
             for k in range(9):
                 ax = fig.add_subplot(3, 3, k + 1)
@@ -514,8 +514,8 @@ def export_pdf(model, cols, path, progress_cb=None):
                     draw_box(ax, model, cols[i + k], stats_table=True)
                 else:
                     ax.axis("off")
-            fig.subplots_adjust(top=0.94, bottom=0.06, left=0.09, right=0.98,
-                                hspace=0.95, wspace=0.45)
+            fig.subplots_adjust(top=0.90, bottom=0.09, left=0.07, right=0.98,
+                                hspace=1.05, wspace=0.40)
             pdf.savefig(fig)
             done += 1
             if progress_cb:
@@ -820,9 +820,16 @@ class App(BaseTk):
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             initialfile=f"{self.model.reliability}_{self.model.lot}_Data_Analysis.pdf",
-            filetypes=[("PDF", "*.pdf")])
+            filetypes=[("PDF", "*.pdf")],
+            confirmoverwrite=False)  # 중복 확인은 아래 팝업에서 직접 수행
         if not path:
             return
+        if os.path.exists(path):
+            if not messagebox.askyesno(
+                    "덮어쓰기 확인",
+                    f"동일한 이름의 파일이 이미 있습니다.\n\n{os.path.basename(path)}\n\n덮어쓸까요?",
+                    parent=self):
+                return
         win = tk.Toplevel(self)
         win.title("PDF 생성 중")
         win.geometry("360x90")
