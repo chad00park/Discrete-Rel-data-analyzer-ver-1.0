@@ -40,6 +40,16 @@ MAX_SAMPLES = 500
 MAX_PARAMS = 500
 MAX_READOUTS = 20
 
+def center_window(win, w=None, h=None):
+    """창을 화면 정중앙에 배치."""
+    win.update_idletasks()
+    ww = w or win.winfo_width() or win.winfo_reqwidth()
+    wh = h or win.winfo_height() or win.winfo_reqheight()
+    x = (win.winfo_screenwidth() - ww) // 2
+    y = (win.winfo_screenheight() - wh) // 2
+    win.geometry(f"+{x}+{y}")
+
+
 READOUT_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -423,6 +433,14 @@ def draw_box(ax, model, col, picker=False, stats_table=True):
                markeredgecolor="black", markersize=5)
         if picker:
             fl.set_picker(5)
+    # Line 그래프와 동일: 색 변경된 점은 삼각형으로 해당 Read-out 위치에 표시
+    for (r, c, s), oc in model.color_over.items():
+        if c != col:
+            continue
+        v = model.value(r, c, s)
+        if v is not None and r in model.readouts:
+            ax.plot([model.readouts.index(r) + 1], [v], marker="^", ms=8,
+                    color=oc, ls="none", zorder=5)
     ax.set_title(col, fontsize=9)
     ax.tick_params(labelsize=7)
     if col in model.ylim:
@@ -430,27 +448,24 @@ def draw_box(ax, model, col, picker=False, stats_table=True):
     ax.grid(True, alpha=0.3)
 
     if stats_table:
-        # Read-out별 통계를 박스 x위치에 1:1 정렬된 표로 표시
+        # Read-out별 통계를 각 박스 x위치에 맞춰 텍스트로 표시 (표 없음)
+        import matplotlib.transforms as mtransforms
+        trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
         rows = [("S/S", "SS"), ("Min", "Min"), ("Max", "Max"),
                 ("AVG", "AVG"), ("STD", "STD")]
-        cell = []
-        for label, key in rows:
-            line = []
-            for r in model.readouts:
+        y0, dy, fs = -0.14, 0.075, 8
+        for k, (label, key) in enumerate(rows):
+            y = y0 - dy * k
+            # 행 라벨 (좌측)
+            ax.text(-0.01, y, label, transform=ax.transAxes,
+                    ha="right", va="center", fontsize=fs, fontweight="bold")
+            for i, r in enumerate(model.readouts):
                 st = model.stats(r, col)
                 v = st[key]
-                line.append(str(v) if key == "SS" else f"{v:.4g}")
-            cell.append(line)
-        tbl = ax.table(cellText=cell, rowLabels=[l for l, _ in rows],
-                       colLabels=model.readouts,
-                       cellLoc="center", rowLoc="center",
-                       bbox=[0.0, -0.62, 1.0, 0.44])
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(6)
-        ax.set_xlabel("")  # 표의 colLabels가 Read-out 라벨을 대신함
-        ax.set_xticklabels([])
-    else:
-        ax.set_xlabel("Read-out", fontsize=8)
+                txt = str(v) if key == "SS" else f"{v:.4g}"
+                ax.text(i + 1, y, txt, transform=trans,
+                        ha="center", va="center", fontsize=fs)
+    ax.set_xlabel("")
     return bp
 
 
@@ -466,42 +481,41 @@ def stats_text(model, col):
 # ============================================================================
 # 5. PDF 출력 (Line 1×4 / Box 4×3, A4 Landscape, 마지막 페이지 크기 유지)
 # ============================================================================
-A4L = (11.69, 8.27)
+PPT_PORTRAIT = (7.5, 13.33)  # 16:9 PPT 슬라이드 세로 방향
 
 
 def export_pdf(model, cols, path, progress_cb=None):
-    total = math.ceil(len(cols) / 4) + math.ceil(len(cols) / 12)
+    total = math.ceil(len(cols) / 3) + math.ceil(len(cols) / 9)
     done = 0
     with PdfPages(path) as pdf:
         title = f"{model.reliability}_{model.lot} Data Analysis"
-        # Line Graph: 1×4 (한 페이지 4개, 세로 배치)
-        for i in range(0, len(cols), 4):
-            fig = Figure(figsize=A4L)
+        # Line Graph: 1페이지 1열 x 3줄
+        for i in range(0, len(cols), 3):
+            fig = Figure(figsize=PPT_PORTRAIT)
             fig.suptitle(title, fontsize=12)
-            for k in range(4):  # 마지막 페이지도 4칸 유지 → 동일 크기
-                ax = fig.add_subplot(4, 1, k + 1)
+            for k in range(3):  # 마지막 페이지도 3칸 유지 → 동일 크기
+                ax = fig.add_subplot(3, 1, k + 1)
                 if i + k < len(cols):
                     draw_line(ax, model, cols[i + k])
                 else:
                     ax.axis("off")
-            fig.tight_layout(rect=(0, 0, 1, 0.95))
+            fig.tight_layout(rect=(0, 0, 1, 0.96))
             pdf.savefig(fig)
             done += 1
             if progress_cb:
                 progress_cb(done, total)
-        # Box Plot: 4×3
-        for i in range(0, len(cols), 12):
-            fig = Figure(figsize=A4L)
+        # Box Plot: 1페이지 3개 x 3줄 (통계 텍스트 공간 확보)
+        for i in range(0, len(cols), 9):
+            fig = Figure(figsize=PPT_PORTRAIT)
             fig.suptitle(title, fontsize=12)
-            for k in range(12):
-                ax = fig.add_subplot(4, 3, k + 1)
+            for k in range(9):
+                ax = fig.add_subplot(3, 3, k + 1)
                 if i + k < len(cols):
                     draw_box(ax, model, cols[i + k], stats_table=True)
                 else:
                     ax.axis("off")
-            # 각 subplot 아래 통계표 공간 확보
-            fig.subplots_adjust(top=0.92, bottom=0.10, left=0.06, right=0.98,
-                                hspace=1.15, wspace=0.35)
+            fig.subplots_adjust(top=0.94, bottom=0.06, left=0.09, right=0.98,
+                                hspace=0.95, wspace=0.45)
             pdf.savefig(fig)
             done += 1
             if progress_cb:
@@ -519,6 +533,7 @@ class App(BaseTk):
         super().__init__()
         self.title("Discrete Reliability Data Analyzer")
         self.geometry("1200x800")
+        center_window(self, 1200, 800)
         self.model = DataModel()
         self.files = []
         self.selected_cols = []
@@ -656,6 +671,7 @@ class App(BaseTk):
         self.box_canvas = FigureCanvasTkAgg(self.box_fig, self.box_tab)
         self.box_canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self.box_canvas, self.box_tab)
+        self.box_canvas.mpl_connect("pick_event", self._on_pick_box)
 
         self._goto(0)
 
@@ -677,11 +693,14 @@ class App(BaseTk):
 
         # Box Plot: 현재 Parameter가 속한 4개 블록을 2×2로 동시 표시
         self.box_fig.clear()
+        self._box_fliers = {}  # flier artist → (readout, colname)
         block = (self.cur_idx // 4) * 4
         group = self.selected_cols[block:block + 4]
         for k, c in enumerate(group):
             ax2 = self.box_fig.add_subplot(2, 2, k + 1)
-            draw_box(ax2, self.model, c, picker=False, stats_table=True)
+            bp = draw_box(ax2, self.model, c, picker=True, stats_table=True)
+            for fl, r in zip(bp["fliers"], self.model.readouts):
+                self._box_fliers[fl] = (r, c)
             if c == col:  # 현재 선택된 Parameter 강조
                 ax2.set_title(c, fontsize=9, fontweight="bold")
         self.box_fig.subplots_adjust(top=0.93, bottom=0.16, left=0.10,
@@ -700,6 +719,29 @@ class App(BaseTk):
         if readout is None or not len(event.ind):
             return
         sample = self.model.samples[event.ind[0]]
+        self._point_menu(readout, col, sample)
+
+    def _on_pick_box(self, event):
+        info = getattr(self, "_box_fliers", {}).get(event.artist)
+        if info is None or not len(event.ind):
+            return
+        readout, col = info
+        yval = event.artist.get_ydata()[event.ind[0]]
+        # outlier 값과 일치하는 시료 번호 역추적
+        sample = None
+        best = float("inf")
+        for s in self.model.samples:
+            v = self.model.value(readout, col, s)
+            if v is None:
+                continue
+            d = abs(v - yval)
+            if d < best:
+                best, sample = d, s
+        tol = max(abs(yval) * 1e-9, 1e-12)
+        if sample is None or best > max(tol, abs(yval) * 1e-6 + 1e-9):
+            # 부동소수 안전 여유 내에서 가장 가까운 시료 사용
+            if sample is None:
+                return
         self._point_menu(readout, col, sample)
 
     def _point_menu(self, readout, col, sample):
@@ -731,12 +773,13 @@ class App(BaseTk):
         dlg.grab_set()
         ttk.Label(dlg, text=col, font=("", 9, "bold")).grid(
             row=0, column=0, columnspan=2, padx=10, pady=(10, 5))
-        ttk.Label(dlg, text="Y Min:").grid(row=1, column=0, sticky="e", padx=5)
-        vmin = tk.StringVar(value="" if cur[0] is None else str(cur[0]))
-        ttk.Entry(dlg, textvariable=vmin, width=15).grid(row=1, column=1, padx=10, pady=3)
-        ttk.Label(dlg, text="Y Max:").grid(row=2, column=0, sticky="e", padx=5)
+        # Y축과 동일한 배치: Max가 위, Min이 아래
+        ttk.Label(dlg, text="Y Max:").grid(row=1, column=0, sticky="e", padx=5)
         vmax = tk.StringVar(value="" if cur[1] is None else str(cur[1]))
-        ttk.Entry(dlg, textvariable=vmax, width=15).grid(row=2, column=1, padx=10, pady=3)
+        ttk.Entry(dlg, textvariable=vmax, width=15).grid(row=1, column=1, padx=10, pady=3)
+        ttk.Label(dlg, text="Y Min:").grid(row=2, column=0, sticky="e", padx=5)
+        vmin = tk.StringVar(value="" if cur[0] is None else str(cur[0]))
+        ttk.Entry(dlg, textvariable=vmin, width=15).grid(row=2, column=1, padx=10, pady=3)
 
         def apply():
             try:
@@ -762,6 +805,7 @@ class App(BaseTk):
         ttk.Button(btns, text="적용", command=apply).pack(side="left", padx=5)
         ttk.Button(btns, text="자동(초기화)", command=reset).pack(side="left", padx=5)
         ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left", padx=5)
+        center_window(dlg)
 
     def _undo(self):
         if self.model.undo():
