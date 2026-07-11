@@ -386,7 +386,10 @@ def draw_line(ax, model, col, picker=False):
                 ax.plot([s], [v], marker="^", ms=8, color=oc, ls="none", zorder=5)
     ax.set_title(col, fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
-    ax.set_ylabel(col.split("@")[0], fontsize=8)
+    # Y축 라벨: Item명 + 단위 (예: "VTH (V)")
+    mu = re.search(r"\(([^()]*)\)\s*(?:#\d+)?$", col)
+    unit = f" ({mu.group(1)})" if mu else ""
+    ax.set_ylabel(col.split("@")[0] + unit, fontsize=8)
     if model.samples:
         ax.set_xlim(min(model.samples) - 1, max(model.samples) + 1)
         even = [s for s in model.samples if s % 2 == 0]
@@ -404,8 +407,13 @@ def draw_box(ax, model, col, picker=False, stats_table=True):
     """Box Plot: X=Read-out, Line Graph와 동일 색상, Median/Outlier 표시.
     stats_table=True면 각 Read-out 박스 위치에 맞춰 아래에 통계표 표시."""
     groups = [model.box_values(r, col) for r in model.readouts]
-    bp = ax.boxplot(groups, labels=model.readouts, patch_artist=True,
-                    showfliers=True, medianprops=dict(color="black"))
+    # Matplotlib 3.9+에서 'labels' → 'tick_labels'로 변경됨 (구버전 폴백 포함)
+    try:
+        bp = ax.boxplot(groups, tick_labels=model.readouts, patch_artist=True,
+                        showfliers=True, medianprops=dict(color="black"))
+    except TypeError:
+        bp = ax.boxplot(groups, labels=model.readouts, patch_artist=True,
+                        showfliers=True, medianprops=dict(color="black"))
     for patch, r in zip(bp["boxes"], model.readouts):
         c = readout_color(model, r)
         patch.set_facecolor(c)
@@ -667,10 +675,17 @@ class App(BaseTk):
         self.line_fig.tight_layout()
         self.line_canvas.draw()
 
+        # Box Plot: 현재 Parameter가 속한 4개 블록을 2×2로 동시 표시
         self.box_fig.clear()
-        ax2 = self.box_fig.add_subplot(111)
-        draw_box(ax2, self.model, col, picker=False, stats_table=True)
-        self.box_fig.subplots_adjust(top=0.9, bottom=0.35, left=0.12, right=0.95)
+        block = (self.cur_idx // 4) * 4
+        group = self.selected_cols[block:block + 4]
+        for k, c in enumerate(group):
+            ax2 = self.box_fig.add_subplot(2, 2, k + 1)
+            draw_box(ax2, self.model, c, picker=False, stats_table=True)
+            if c == col:  # 현재 선택된 Parameter 강조
+                ax2.set_title(c, fontsize=9, fontweight="bold")
+        self.box_fig.subplots_adjust(top=0.93, bottom=0.16, left=0.10,
+                                     right=0.97, hspace=0.85, wspace=0.35)
         self.box_canvas.draw()
 
     # ---- 편집 --------------------------------------------------------------
@@ -710,18 +725,43 @@ class App(BaseTk):
     def _set_ylim(self):
         col = self.selected_cols[self.cur_idx]
         cur = self.model.ylim.get(col, (None, None))
-        ymin = simpledialog.askfloat("Y축", "Y Min (취소=자동):",
-                                     initialvalue=cur[0])
-        if ymin is None:
-            self.model.set_ylim(col, None, None)
+        dlg = tk.Toplevel(self)
+        dlg.title("Y축 Min/Max")
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text=col, font=("", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, padx=10, pady=(10, 5))
+        ttk.Label(dlg, text="Y Min:").grid(row=1, column=0, sticky="e", padx=5)
+        vmin = tk.StringVar(value="" if cur[0] is None else str(cur[0]))
+        ttk.Entry(dlg, textvariable=vmin, width=15).grid(row=1, column=1, padx=10, pady=3)
+        ttk.Label(dlg, text="Y Max:").grid(row=2, column=0, sticky="e", padx=5)
+        vmax = tk.StringVar(value="" if cur[1] is None else str(cur[1]))
+        ttk.Entry(dlg, textvariable=vmax, width=15).grid(row=2, column=1, padx=10, pady=3)
+
+        def apply():
+            try:
+                ymin = float(vmin.get())
+                ymax = float(vmax.get())
+            except ValueError:
+                messagebox.showwarning("알림", "숫자를 입력하세요.", parent=dlg)
+                return
+            if ymax <= ymin:
+                messagebox.showwarning("알림", "Y Max는 Y Min보다 커야 합니다.", parent=dlg)
+                return
+            self.model.set_ylim(col, ymin, ymax)
+            dlg.destroy()
             self._redraw()
-            return
-        ymax = simpledialog.askfloat("Y축", "Y Max:", initialvalue=cur[1])
-        if ymax is None or ymax <= ymin:
-            messagebox.showwarning("알림", "Y Max는 Y Min보다 커야 합니다.")
-            return
-        self.model.set_ylim(col, ymin, ymax)
-        self._redraw()
+
+        def reset():
+            self.model.set_ylim(col, None, None)
+            dlg.destroy()
+            self._redraw()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text="적용", command=apply).pack(side="left", padx=5)
+        ttk.Button(btns, text="자동(초기화)", command=reset).pack(side="left", padx=5)
+        ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left", padx=5)
 
     def _undo(self):
         if self.model.undo():
