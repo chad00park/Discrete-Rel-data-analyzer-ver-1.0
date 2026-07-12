@@ -487,13 +487,19 @@ def draw_line(ax, model, group, col, picker=False):
     return artists
 
 
+def delta_title(model, group, col):
+    """Delta 제목: 단위 위치에 일괄 [%] 적용."""
+    t = f"{model.reliability}: {group}, {col_title(col)}"
+    return re.sub(r"\[[^\[\]]*\]", "[%]", t, count=1)
+
+
 def draw_delta(ax, model, group, col):
     """Delta % graph: 초기 Read-out 기준 변화율. layout은 Read-out graph와 동일."""
     for r in model.readouts(group)[1:]:
         c = readout_color(model, group, r)
         xs, ys = model.delta_series(group, r, col)
         ax.plot(xs, ys, marker="o", ms=4, lw=1, color=c, label=r)
-    ax.set_title(graph_title(model, group, col), fontsize=9)
+    ax.set_title(delta_title(model, group, col), fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
     ax.set_ylabel("Delta (%)", fontsize=8)
     _apply_x_axis(ax, model, group)
@@ -579,21 +585,28 @@ def export_pdf(model, pairs, path, progress_cb=None):
         per_group.setdefault(g, []).append(c)
     order = [g for g in model.groups if g in per_group]
 
-    total = sum(len(per_group[g]) + math.ceil(len(per_group[g]) / 6) for g in order)
+    total = sum(math.ceil(len(per_group[g]) / 2)
+                + math.ceil(len(per_group[g]) / 6) for g in order)
     done = 0
     with PdfPages(path) as pdf:
         for g in order:
             cols = per_group[g]
             head = f"{model.reliability}: {g}"
-            # 1) item별 Read-out + Delta % 쌍 (1페이지 2줄)
-            for c in cols:
+            # 1) item별 Read-out + Delta % 쌍 — 1페이지 1줄 1개 x 4줄 (item 2개분)
+            for i in range(0, len(cols), 2):
                 fig = Figure(figsize=PPT_LANDSCAPE)
                 fig.suptitle(f"{head} — Read-out & Delta %", fontsize=12)
-                ax1 = fig.add_subplot(2, 1, 1)
-                draw_line(ax1, model, g, c)
-                ax2 = fig.add_subplot(2, 1, 2)
-                draw_delta(ax2, model, g, c)
-                fig.tight_layout(rect=(0, 0, 1, 0.95))
+                for k in range(2):  # 마지막 페이지도 4칸 유지 → 동일 크기
+                    ax1 = fig.add_subplot(4, 1, 2 * k + 1)
+                    ax2 = fig.add_subplot(4, 1, 2 * k + 2)
+                    if i + k < len(cols):
+                        c = cols[i + k]
+                        draw_line(ax1, model, g, c)
+                        draw_delta(ax2, model, g, c)
+                    else:
+                        ax1.axis("off")
+                        ax2.axis("off")
+                fig.tight_layout(rect=(0, 0, 1, 0.96))
                 pdf.savefig(fig)
                 done += 1
                 if progress_cb:
