@@ -745,6 +745,7 @@ class App(BaseTk):
         self.files = []
         self.selected = []   # [(group, col)]
         self.cur_idx = 0
+        self.box_page = 0
         self._build_start()
 
     def _reset_all(self):
@@ -907,6 +908,15 @@ class App(BaseTk):
         self.delta_canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self.delta_canvas, self.delta_tab)
 
+        ctrl = ttk.Frame(self.box_tab)
+        ctrl.pack(fill="x")
+        ttk.Button(ctrl, text="◀", width=3,
+                   command=lambda: self._box_nav(-1)).pack(side="left", padx=(8, 2))
+        self.box_page_lbl = ttk.Label(ctrl, text="")
+        self.box_page_lbl.pack(side="left")
+        ttk.Button(ctrl, text="▶", width=3,
+                   command=lambda: self._box_nav(1)).pack(side="left", padx=2)
+
         self.box_fig = Figure(figsize=(10, 5))
         self.box_canvas = FigureCanvasTkAgg(self.box_fig, self.box_tab)
         self.box_canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -927,6 +937,9 @@ class App(BaseTk):
 
     def _goto(self, idx):
         self.cur_idx = idx
+        group, col = self.selected[idx]
+        same_group = [p for p in self.selected if p[0] == group]
+        self.box_page = same_group.index((group, col)) // 4
         self.param_var.set(self._labels[idx])
         self._redraw()
 
@@ -945,13 +958,28 @@ class App(BaseTk):
         self.delta_fig.tight_layout()
         self.delta_canvas.draw()
 
-        # Box plot: 같은 그룹 내에서 현재 Parameter가 속한 4개 블록을 2×2로 표시
+        self._redraw_box()
+
+    def _box_nav(self, d):
+        group, _ = self.selected[self.cur_idx]
+        same_group = [p for p in self.selected if p[0] == group]
+        pages = max(1, math.ceil(len(same_group) / 4))
+        nxt = self.box_page + d
+        if nxt < 0 or nxt >= pages:
+            return
+        self.box_page = nxt
+        self._redraw_box()
+
+    def _redraw_box(self):
+        group, col = self.selected[self.cur_idx]
         self.box_fig.clear()
         self._box_fliers = {}  # flier artist → (group, readout, colname)
         same_group = [p for p in self.selected if p[0] == group]
-        pos = same_group.index((group, col))
-        block = (pos // 4) * 4
-        for k, (g2, c2) in enumerate(same_group[block:block + 4]):
+        pages = max(1, math.ceil(len(same_group) / 4))
+        self.box_page = min(self.box_page, pages - 1)
+        self.box_page_lbl.config(text=f"{self.box_page + 1}/{pages}")
+        page_items = same_group[self.box_page * 4:(self.box_page + 1) * 4]
+        for k, (g2, c2) in enumerate(page_items):
             ax2 = self.box_fig.add_subplot(2, 2, k + 1)
             bp = draw_box(ax2, self.model, g2, c2, picker=True, stats_table=True)
             for fl, r in zip(bp["fliers"], self.model.readouts(g2)):
