@@ -80,7 +80,7 @@ def parse_filename(path):
     """파일명에서 (reliability, lot, readout_label, readout_value) 추출.
     실패 시 ValueError."""
     base = os.path.splitext(os.path.basename(path))[0]
-    tokens = [t for t in re.split(r"[_\-\+\s]+", base) if t]
+    tokens = [t for t in re.split(r"[_\s]+", base) if t]
     readout_label = None
     readout_value = None
     lot = None
@@ -103,7 +103,7 @@ def parse_filename(path):
         raise ValueError(
             f"파일명 인식 실패: '{os.path.basename(path)}'\n"
             "파일 이름은 신뢰성명 + Lot번호 + Read-out 형식이어야 합니다.\n"
-            "예: HTRB_Lot1_0hr, TC+Lot2+500cyc"
+            "예: HTRB_Lot1_0hr, HTBG+_Lot2_500cyc (구분자는 _ 또는 공백)"
         )
     reliability = "_".join(rest).upper()
     return reliability, lot, readout_label, readout_value
@@ -235,6 +235,7 @@ class DataModel:
         self.deleted = set()        # (group, readout, col, sample)
         self.color_over = {}        # (group, readout, col, sample) -> hex
         self.ylim = {}              # (group, col) -> (ymin, ymax)
+        self.ref_lines = {}         # (lot, col, kind) -> [ {axis,value,name,color} ]
         self._undo = []
         self._redo = []
 
@@ -317,6 +318,7 @@ class DataModel:
         self.deleted.clear()
         self.color_over.clear()
         self.ylim.clear()
+        self.ref_lines.clear()
         self._undo.clear()
         self._redo.clear()
         return errors
@@ -387,6 +389,13 @@ class DataModel:
                 self.ylim.pop(key, None)
             else:
                 self.ylim[key] = v
+        elif kind == "refline":
+            _, key, old, new = action
+            v = new if forward else old
+            if not v:
+                self.ref_lines.pop(key, None)
+            else:
+                self.ref_lines[key] = v
 
     def do(self, action):
         self._apply(action, True)
@@ -421,6 +430,11 @@ class DataModel:
         key = (group, readout, col, sample)
         self.do(("color", key, self.color_over.get(key), color))
 
+    def set_ref_lines(self, group, col, kind, lines):
+        key = (group, col, kind)
+        old = list(self.ref_lines.get(key, []))
+        self.do(("refline", key, old, list(lines)))
+
     def set_ylim(self, group, col, ymin, ymax):
         key = (group, col)
         self.do(("ylim", key, self.ylim.get(key),
@@ -440,6 +454,69 @@ class DataModel:
 # ============================================================================
 # 4. 그래프 렌더링 (화면/PDF 공용 파이프라인) — 모두 (group, col) 단위
 # ============================================================================
+def draw_ref_lines(ax, model, group, col, kind):
+    """(점선) 임의 기준선 + 이름을 그래프 안쪽에 표시.
+    이름은 data line과 겹침이 적은 쪽(위/아래, 좌/우)에 배치하고
+    기준선과 가는 실선으로 연결한다."""
+    lines = model.ref_lines.get((group, col, kind), [])
+    if not lines:
+        return
+    # 현재 그려진 data line들의 점 수집 (겹침 회피 판단용)
+    pts_x, pts_y = [], []
+    for ln in ax.get_lines():
+        if ln.get_marker() == "o":
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            for x, y in zip(xd, yd):
+                try:
+                    if not (math.isnan(float(y))):
+                        pts_x.append(float(x))
+                        pts_y.append(float(y))
+                except (TypeError, ValueError):
+                    pass
+    y0, y1 = ax.get_ylim()
+    x0, x1 = ax.get_xlim()
+    yr = (y1 - y0) or 1.0
+    xr = (x1 - x0) or 1.0
+    for rl in lines:
+        c = rl.get("color") or "red"
+        name = rl.get("name", "")
+        v = rl["value"]
+        if rl["axis"] == "y":
+            ax.axhline(v, color=c, ls=":", lw=1.2, zorder=4)
+            if not name:
+                continue
+            dy = 0.07 * yr
+            # 선 위/아래 근처의 data 점 수를 비교해 덜 붐비는 쪽 선택
+            above = sum(1 for y in pts_y if v < y <= v + 2 * dy)
+            below = sum(1 for y in pts_y if v - 2 * dy <= y < v)
+            ty = v + dy if above <= below else v - dy
+            ty = min(max(ty, y0 + 0.03 * yr), y1 - 0.03 * yr)
+            tx = x1 - 0.02 * xr          # 이름 위치 (그래프 안쪽 우측)
+            ax_anchor = x1 - 0.10 * xr   # 기준선 위 연결점
+            ax.annotate(name, xy=(ax_anchor, v), xytext=(tx, ty),
+                        ha="right", va="center", fontsize=7, color=c,
+                        zorder=6, arrowprops=dict(arrowstyle="-", color=c,
+                                                  lw=0.7, alpha=0.9))
+        else:
+            ax.axvline(v, color=c, ls=":", lw=1.2, zorder=4)
+            if not name:
+                continue
+            dx = 0.05 * xr
+            right = sum(1 for x, y in zip(pts_x, pts_y)
+                        if v < x <= v + 2 * dx and y > y1 - 0.25 * yr)
+            left = sum(1 for x, y in zip(pts_x, pts_y)
+                       if v - 2 * dx <= x < v and y > y1 - 0.25 * yr)
+            tx = v + dx if right <= left else v - dx
+            tx = min(max(tx, x0 + 0.03 * xr), x1 - 0.03 * xr)
+            ty = y1 - 0.08 * yr          # 이름 위치 (그래프 안쪽 상단)
+            ay_anchor = y1 - 0.16 * yr   # 기준선 위 연결점
+            ax.annotate(name, xy=(v, ay_anchor), xytext=(tx, ty),
+                        ha="center", va="bottom", fontsize=7, color=c,
+                        zorder=6, arrowprops=dict(arrowstyle="-", color=c,
+                                                  lw=0.7, alpha=0.9))
+
+
 def readout_color(model, group, readout):
     return READOUT_COLORS[model.readouts(group).index(readout) % len(READOUT_COLORS)]
 
@@ -459,7 +536,7 @@ def graph_title(model, group, col):
     return f"{model.reliability}: {group}, {col_title(col)}"
 
 
-def draw_line(ax, model, group, col, picker=False):
+def draw_line(ax, model, group, col, picker=False, screen=False):
     """Read-out graph: X=Sample(짝수 Label/홀수 Minor Tick), Read-out별 색상."""
     artists = {}
     for r in model.readouts(group):
@@ -473,7 +550,7 @@ def draw_line(ax, model, group, col, picker=False):
         for s, v in zip(xs, ys):
             oc = model.color_over.get((group, r, col, s))
             if oc and not math.isnan(v):
-                ax.plot([s], [v], marker="^", ms=8, color=oc, ls="none", zorder=5)
+                ax.plot([s], [v], marker="^", ms=5, color=oc, ls="none", zorder=5)
     ax.set_title(graph_title(model, group, col), fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
     mu = re.search(r"\(([^()]*)\)\s*(?:#\d+)?$", col)
@@ -482,7 +559,23 @@ def draw_line(ax, model, group, col, picker=False):
     _apply_x_axis(ax, model, group)
     if (group, col) in model.ylim:
         ax.set_ylim(*model.ylim[(group, col)])
-    ax.legend(fontsize=6, ncol=2)
+    else:
+        # 기본: 모든 Read-out 그래프는 Y축 0 ~ (데이터 max의 110%)
+        vmax = None
+        for _ln in ax.get_lines():
+            for _y in _ln.get_ydata():
+                try:
+                    fy = float(_y)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isnan(fy) and (vmax is None or fy > vmax):
+                    vmax = fy
+        if vmax is not None and vmax > 0:
+            ax.set_ylim(0, vmax * 1.10)
+        else:
+            ax.set_ylim(bottom=0)
+    draw_ref_lines(ax, model, group, col, "line")
+    ax.legend(fontsize=9 if screen else 6, ncol=2)
     ax.grid(True, alpha=0.3)
     return artists
 
@@ -493,18 +586,24 @@ def delta_title(model, group, col):
     return re.sub(r"\[[^\[\]]*\]", "[%]", t, count=1)
 
 
-def draw_delta(ax, model, group, col):
+def draw_delta(ax, model, group, col, screen=False):
     """Delta % graph: 초기 Read-out 기준 변화율. layout은 Read-out graph와 동일."""
     for r in model.readouts(group)[1:]:
         c = readout_color(model, group, r)
         xs, ys = model.delta_series(group, r, col)
         ax.plot(xs, ys, marker="o", ms=4, lw=1, color=c, label=r)
+        for s, v in zip(xs, ys):
+            oc = model.color_over.get((group, r, col, s))
+            if oc and not math.isnan(v):
+                ax.plot([s], [v], marker="^", ms=5, color=oc, ls="none", zorder=5)
     ax.set_title(delta_title(model, group, col), fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
     ax.set_ylabel("Delta (%)", fontsize=8)
     _apply_x_axis(ax, model, group)
     ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.7)
-    ax.legend(fontsize=6, ncol=2)
+    draw_ref_lines(ax, model, group, col, "delta")
+    if len(model.readouts(group)) > 1:
+        ax.legend(fontsize=9 if screen else 6, ncol=2)
     ax.grid(True, alpha=0.3)
 
 
@@ -526,7 +625,7 @@ def draw_box(ax, model, group, col, picker=False, stats_table=True):
         patch.set_alpha(0.5)
     for fl, r in zip(bp["fliers"], readouts):
         fl.set(marker="o", markerfacecolor=readout_color(model, group, r),
-               markeredgecolor="black", markersize=5)
+               markeredgecolor="black", markersize=3)
         if picker:
             fl.set_picker(5)
     # 색 변경된 점은 삼각형으로 해당 Read-out 위치에 표시 (Line과 동일 규칙)
@@ -535,12 +634,13 @@ def draw_box(ax, model, group, col, picker=False, stats_table=True):
             continue
         v = model.value(group, r, c, s)
         if v is not None and r in readouts:
-            ax.plot([readouts.index(r) + 1], [v], marker="^", ms=8,
+            ax.plot([readouts.index(r) + 1], [v], marker="^", ms=5,
                     color=oc, ls="none", zorder=5)
     ax.set_title(graph_title(model, group, col), fontsize=9)
     ax.tick_params(labelsize=7)
     if (group, col) in model.ylim:
         ax.set_ylim(*model.ylim[(group, col)])
+    draw_ref_lines(ax, model, group, col, "box")
     ax.grid(True, alpha=0.3)
 
     if stats_table:
@@ -647,6 +747,17 @@ class App(BaseTk):
         self.cur_idx = 0
         self._build_start()
 
+    def _reset_all(self):
+        """진행 내용을 모두 초기화하고 처음 화면으로."""
+        if not messagebox.askyesno("처음으로", "진행하던 내용을 모두 지우고\n처음 화면으로 돌아갈까요?",
+                                   parent=self):
+            return
+        self.model = DataModel()
+        self.files = []
+        self.selected = []
+        self.cur_idx = 0
+        self._build_start()
+
     # ---- 화면 1: 파일 선택 -------------------------------------------------
     def _build_start(self):
         for w in self.winfo_children():
@@ -656,7 +767,7 @@ class App(BaseTk):
         ttk.Label(frm, text="Discrete Reliability Data Analyzer",
                   font=("", 16, "bold")).pack(pady=10)
         ttk.Label(frm, text="파일 이름은 신뢰성명 + Lot번호 + Read-out 형식이어야 합니다.\n"
-                            "예: HTRB_Lot1_0hr.csv, TC+Lot2+500cyc.xlsx\n"
+                            "예: HTRB_Lot1_0hr.csv, HTBG+_Lot2_500cyc.xlsx (구분자: _ 또는 공백)\n"
                             "서로 다른 신뢰성/Lot은 자동으로 구분되어 각각 분석됩니다.").pack(pady=5)
 
         drop = tk.Label(frm, text="여기에 파일을 Drag && Drop 하세요"
@@ -731,6 +842,7 @@ class App(BaseTk):
                    command=lambda: self.param_lb.select_set(0, "end")).pack(side="left", padx=5)
         ttk.Button(btns, text="분석 시작", command=self._analyze).pack(side="left", padx=5)
         ttk.Button(btns, text="← 파일 다시 선택", command=self._build_start).pack(side="left", padx=5)
+        ttk.Button(btns, text="⟲ 처음으로 (Reset)", command=self._reset_all).pack(side="left", padx=5)
         self.pbar = ttk.Progressbar(frm, mode="determinate")
         self.pbar.pack(fill="x", pady=5)
 
@@ -744,7 +856,6 @@ class App(BaseTk):
         self.pbar["maximum"] = len(self.selected)
         self.pbar["value"] = len(self.selected)
         self.update_idletasks()
-        messagebox.showinfo("완료", "Data 분석이 완료되었습니다.", parent=self)
         self._build_graphs()
 
     # ---- 화면 3: 그래프 -------------------------------------------------------
@@ -770,9 +881,11 @@ class App(BaseTk):
         ttk.Button(top, text="다음 ▶", command=lambda: self._nav(1)).pack(side="left", padx=3)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(top, text="Y축 Min/Max", command=self._set_ylim).pack(side="left", padx=3)
+        ttk.Button(top, text="기준선", command=self._ref_line_dialog).pack(side="left", padx=3)
         ttk.Button(top, text="Undo", command=self._undo).pack(side="left", padx=3)
         ttk.Button(top, text="Redo", command=self._redo).pack(side="left", padx=3)
         ttk.Button(top, text="Export PDF", command=self._export_pdf).pack(side="right", padx=3)
+        ttk.Button(top, text="⟲ 처음으로", command=self._reset_all).pack(side="right", padx=3)
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True)
@@ -822,13 +935,13 @@ class App(BaseTk):
 
         self.line_fig.clear()
         ax = self.line_fig.add_subplot(111)
-        self._line_artists = draw_line(ax, self.model, group, col, picker=True)
+        self._line_artists = draw_line(ax, self.model, group, col, picker=True, screen=True)
         self.line_fig.tight_layout()
         self.line_canvas.draw()
 
         self.delta_fig.clear()
         axd = self.delta_fig.add_subplot(111)
-        draw_delta(axd, self.model, group, col)
+        draw_delta(axd, self.model, group, col, screen=True)
         self.delta_fig.tight_layout()
         self.delta_canvas.draw()
 
@@ -944,6 +1057,94 @@ class App(BaseTk):
         ttk.Button(btns, text="적용", command=apply).pack(side="left", padx=5)
         ttk.Button(btns, text="자동(초기화)", command=reset).pack(side="left", padx=5)
         ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left", padx=5)
+        center_window(dlg)
+
+    def _ref_line_dialog(self):
+        group, col = self.selected[self.cur_idx]
+        kinds = [("Read-out graph", "line"), ("Delta % graph", "delta"), ("Box plot", "box")]
+        try:
+            cur_tab = self.nb.index(self.nb.select())
+        except Exception:
+            cur_tab = 0
+
+        dlg = tk.Toplevel(self)
+        dlg.title("기준선 관리")
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text=self._label((group, col)), font=("", 9, "bold")).grid(
+            row=0, column=0, columnspan=4, padx=10, pady=(10, 5))
+
+        ttk.Label(dlg, text="대상 그래프:").grid(row=1, column=0, sticky="e", padx=5)
+        kind_cb = ttk.Combobox(dlg, state="readonly", width=16,
+                               values=[k[0] for k in kinds])
+        kind_cb.current(min(cur_tab, 2))
+        kind_cb.grid(row=1, column=1, columnspan=3, sticky="w", pady=2)
+
+        lb = tk.Listbox(dlg, height=5, width=48)
+        lb.grid(row=2, column=0, columnspan=4, padx=10, pady=5)
+
+        def cur_kind():
+            return kinds[kind_cb.current()][1]
+
+        def refresh():
+            lb.delete(0, "end")
+            for rl in self.model.ref_lines.get((group, col, cur_kind()), []):
+                lb.insert("end", f"[{rl['axis'].upper()}={rl['value']}] "
+                                 f"{rl['name']}  ({rl['color']})")
+        kind_cb.bind("<<ComboboxSelected>>", lambda e: refresh())
+
+        ttk.Label(dlg, text="축:").grid(row=3, column=0, sticky="e", padx=5)
+        axis_cb = ttk.Combobox(dlg, state="readonly", width=4, values=["Y", "X"])
+        axis_cb.current(0)
+        axis_cb.grid(row=3, column=1, sticky="w")
+        ttk.Label(dlg, text="값:").grid(row=3, column=2, sticky="e", padx=5)
+        val_var = tk.StringVar()
+        ttk.Entry(dlg, textvariable=val_var, width=10).grid(row=3, column=3, sticky="w")
+        ttk.Label(dlg, text="이름:").grid(row=4, column=0, sticky="e", padx=5)
+        name_var = tk.StringVar(value="High limit")
+        ttk.Entry(dlg, textvariable=name_var, width=14).grid(row=4, column=1, sticky="w")
+        color_var = tk.StringVar(value="#d62728")
+        color_btn = tk.Button(dlg, text="색 선택", bg=color_var.get(), width=8,
+                              command=lambda: _pick_color())
+        color_btn.grid(row=4, column=2, columnspan=2, sticky="w", padx=5)
+
+        def _pick_color():
+            c = colorchooser.askcolor(color=color_var.get(), parent=dlg)[1]
+            if c:
+                color_var.set(c)
+                color_btn.config(bg=c)
+
+        def add():
+            try:
+                v = float(val_var.get())
+            except ValueError:
+                messagebox.showwarning("알림", "값에 숫자를 입력하세요.", parent=dlg)
+                return
+            k = cur_kind()
+            lines = list(self.model.ref_lines.get((group, col, k), []))
+            lines.append(dict(axis=axis_cb.get().lower(), value=v,
+                              name=name_var.get().strip(), color=color_var.get()))
+            self.model.set_ref_lines(group, col, k, lines)
+            refresh()
+            self._redraw()
+
+        def remove():
+            sel = lb.curselection()
+            if not sel:
+                return
+            k = cur_kind()
+            lines = list(self.model.ref_lines.get((group, col, k), []))
+            del lines[sel[0]]
+            self.model.set_ref_lines(group, col, k, lines)
+            refresh()
+            self._redraw()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=5, column=0, columnspan=4, pady=10)
+        ttk.Button(btns, text="추가", command=add).pack(side="left", padx=5)
+        ttk.Button(btns, text="선택 삭제", command=remove).pack(side="left", padx=5)
+        ttk.Button(btns, text="닫기", command=dlg.destroy).pack(side="left", padx=5)
+        refresh()
         center_window(dlg)
 
     def _undo(self):
