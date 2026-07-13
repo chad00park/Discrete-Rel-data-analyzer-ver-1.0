@@ -455,21 +455,18 @@ class DataModel:
 # 4. 그래프 렌더링 (화면/PDF 공용 파이프라인) — 모두 (group, col) 단위
 # ============================================================================
 def draw_ref_lines(ax, model, group, col, kind):
-    """(점선) 임의 기준선 + 이름을 그래프 안쪽에 표시.
-    이름은 data line과 겹침이 적은 쪽(위/아래, 좌/우)에 배치하고
-    기준선과 가는 실선으로 연결한다."""
+    """(점선) 임의 기준선 + 이름 표시.
+    1순위: 기준선 바로 윗부분 중 data/legend와 겹치지 않는 빈 구간에 표기.
+    회피 불가 시에만 빈 공간으로 이동하고 기준선과 실선으로 연결."""
     lines = model.ref_lines.get((group, col, kind), [])
     if not lines:
         return
-    # 현재 그려진 data line들의 점 수집 (겹침 회피 판단용)
     pts_x, pts_y = [], []
     for ln in ax.get_lines():
         if ln.get_marker() == "o":
-            xd = ln.get_xdata()
-            yd = ln.get_ydata()
-            for x, y in zip(xd, yd):
+            for x, y in zip(ln.get_xdata(), ln.get_ydata()):
                 try:
-                    if not (math.isnan(float(y))):
+                    if not math.isnan(float(y)):
                         pts_x.append(float(x))
                         pts_y.append(float(y))
                 except (TypeError, ValueError):
@@ -478,6 +475,12 @@ def draw_ref_lines(ax, model, group, col, kind):
     x0, x1 = ax.get_xlim()
     yr = (y1 - y0) or 1.0
     xr = (x1 - x0) or 1.0
+    has_legend = ax.get_legend() is not None
+
+    def in_legend_zone(xf, yf):
+        # legend는 loc='upper right' 고정 → 우상단 영역을 회피 구역으로 간주
+        return has_legend and xf > 0.58 and yf > 0.68
+
     for rl in lines:
         c = rl.get("color") or "red"
         name = rl.get("name", "")
@@ -486,35 +489,70 @@ def draw_ref_lines(ax, model, group, col, kind):
             ax.axhline(v, color=c, ls=":", lw=1.2, zorder=4)
             if not name:
                 continue
-            dy = 0.07 * yr
-            # 선 위/아래 근처의 data 점 수를 비교해 덜 붐비는 쪽 선택
-            above = sum(1 for y in pts_y if v < y <= v + 2 * dy)
-            below = sum(1 for y in pts_y if v - 2 * dy <= y < v)
-            ty = v + dy if above <= below else v - dy
-            ty = min(max(ty, y0 + 0.03 * yr), y1 - 0.03 * yr)
-            tx = x1 - 0.02 * xr          # 이름 위치 (그래프 안쪽 우측)
-            ax_anchor = x1 - 0.10 * xr   # 기준선 위 연결점
-            ax.annotate(name, xy=(ax_anchor, v), xytext=(tx, ty),
-                        ha="right", va="center", fontsize=7, color=c,
-                        zorder=6, arrowprops=dict(arrowstyle="-", color=c,
-                                                  lw=0.7, alpha=0.9))
+            dy = 0.05 * yr
+            ty = v + 0.010 * yr           # 기준선 바로 위
+            yf = (ty - y0) / yr
+            placed = False
+            if 0.02 < (v - y0) / yr < 0.965:  # 선이 축 범위 안에 있을 때만
+                # 좌→우로 훑으며 빈 구간 탐색
+                for xf in [0.06, 0.16, 0.26, 0.36, 0.46, 0.56, 0.66, 0.76, 0.86]:
+                    cx = x0 + xf * xr
+                    if in_legend_zone(xf, yf + 0.05):
+                        continue
+                    crowded = any(abs(px - cx) < 0.07 * xr and
+                                  v - 0.5 * dy <= py <= v + 2.2 * dy
+                                  for px, py in zip(pts_x, pts_y))
+                    if not crowded:
+                        ax.text(cx, ty, name, ha="left", va="bottom",
+                                fontsize=7, color=c, zorder=6)
+                        placed = True
+                        break
+            if not placed:
+                # 회피 불가 → 빈 공간으로 이동 + 연결선
+                above = sum(1 for y in pts_y if v < y <= v + 2 * dy)
+                below = sum(1 for y in pts_y if v - 2 * dy <= y < v)
+                ty2 = v + 1.8 * dy if above <= below else v - 1.8 * dy
+                ty2 = min(max(ty2, y0 + 0.04 * yr), y1 - 0.04 * yr)
+                if has_legend:
+                    tx, anchor, ha = x0 + 0.02 * xr, x0 + 0.10 * xr, "left"
+                else:
+                    tx, anchor, ha = x1 - 0.02 * xr, x1 - 0.10 * xr, "right"
+                ax.annotate(name, xy=(anchor, v), xytext=(tx, ty2),
+                            ha=ha, va="center", fontsize=7, color=c, zorder=6,
+                            arrowprops=dict(arrowstyle="-", color=c,
+                                            lw=0.7, alpha=0.9))
         else:
             ax.axvline(v, color=c, ls=":", lw=1.2, zorder=4)
             if not name:
                 continue
-            dx = 0.05 * xr
-            right = sum(1 for x, y in zip(pts_x, pts_y)
-                        if v < x <= v + 2 * dx and y > y1 - 0.25 * yr)
-            left = sum(1 for x, y in zip(pts_x, pts_y)
-                       if v - 2 * dx <= x < v and y > y1 - 0.25 * yr)
-            tx = v + dx if right <= left else v - dx
-            tx = min(max(tx, x0 + 0.03 * xr), x1 - 0.03 * xr)
-            ty = y1 - 0.08 * yr          # 이름 위치 (그래프 안쪽 상단)
-            ay_anchor = y1 - 0.16 * yr   # 기준선 위 연결점
-            ax.annotate(name, xy=(v, ay_anchor), xytext=(tx, ty),
-                        ha="center", va="bottom", fontsize=7, color=c,
-                        zorder=6, arrowprops=dict(arrowstyle="-", color=c,
-                                                  lw=0.7, alpha=0.9))
+            vf = (v - x0) / xr
+            placed = False
+            # 세로 기준선의 "윗부분": 선을 따라 위에서부터 빈 자리 탐색
+            for yf in [0.90, 0.78, 0.66, 0.54, 0.42]:
+                cy = y0 + yf * yr
+                if in_legend_zone(vf, yf):
+                    continue
+                crowded = any(abs(px - v) < 0.05 * xr and
+                              abs(py - cy) < 0.07 * yr
+                              for px, py in zip(pts_x, pts_y))
+                if not crowded:
+                    ax.text(v + 0.008 * xr, cy, name, ha="left", va="center",
+                            fontsize=7, color=c, zorder=6)
+                    placed = True
+                    break
+            if not placed:
+                dx = 0.05 * xr
+                right = sum(1 for x, y in zip(pts_x, pts_y)
+                            if v < x <= v + 3 * dx and y > y1 - 0.3 * yr)
+                left = sum(1 for x, y in zip(pts_x, pts_y)
+                           if v - 3 * dx <= x < v and y > y1 - 0.3 * yr)
+                tx = v + 2 * dx if right <= left else v - 2 * dx
+                tx = min(max(tx, x0 + 0.04 * xr), x1 - 0.04 * xr)
+                ty = y1 - 0.40 * yr if in_legend_zone((tx - x0) / xr, 0.9) else y1 - 0.10 * yr
+                ax.annotate(name, xy=(v, ty - 0.06 * yr), xytext=(tx, ty),
+                            ha="center", va="bottom", fontsize=7, color=c,
+                            zorder=6, arrowprops=dict(arrowstyle="-", color=c,
+                                                      lw=0.7, alpha=0.9))
 
 
 def readout_color(model, group, readout):
@@ -550,7 +588,7 @@ def draw_line(ax, model, group, col, picker=False, screen=False):
         for s, v in zip(xs, ys):
             oc = model.color_over.get((group, r, col, s))
             if oc and not math.isnan(v):
-                ax.plot([s], [v], marker="^", ms=5, color=oc, ls="none", zorder=5)
+                ax.plot([s], [v], marker="^", ms=5, color=oc, markeredgecolor="black", markeredgewidth=0.6, ls="none", zorder=5)
     ax.set_title(graph_title(model, group, col), fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
     mu = re.search(r"\(([^()]*)\)\s*(?:#\d+)?$", col)
@@ -574,8 +612,8 @@ def draw_line(ax, model, group, col, picker=False, screen=False):
             ax.set_ylim(0, vmax * 1.10)
         else:
             ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9 if screen else 6, ncol=2, loc="upper right")
     draw_ref_lines(ax, model, group, col, "line")
-    ax.legend(fontsize=9 if screen else 6, ncol=2)
     ax.grid(True, alpha=0.3)
     return artists
 
@@ -595,15 +633,15 @@ def draw_delta(ax, model, group, col, screen=False):
         for s, v in zip(xs, ys):
             oc = model.color_over.get((group, r, col, s))
             if oc and not math.isnan(v):
-                ax.plot([s], [v], marker="^", ms=5, color=oc, ls="none", zorder=5)
+                ax.plot([s], [v], marker="^", ms=5, color=oc, markeredgecolor="black", markeredgewidth=0.6, ls="none", zorder=5)
     ax.set_title(delta_title(model, group, col), fontsize=9)
     ax.set_xlabel("Sample No.", fontsize=8)
     ax.set_ylabel("Delta (%)", fontsize=8)
     _apply_x_axis(ax, model, group)
     ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.7)
-    draw_ref_lines(ax, model, group, col, "delta")
     if len(model.readouts(group)) > 1:
-        ax.legend(fontsize=9 if screen else 6, ncol=2)
+        ax.legend(fontsize=9 if screen else 6, ncol=2, loc="upper right")
+    draw_ref_lines(ax, model, group, col, "delta")
     ax.grid(True, alpha=0.3)
 
 
