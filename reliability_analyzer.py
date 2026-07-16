@@ -85,7 +85,11 @@ def parse_filename(path):
     readout_value = None
     lot = None
     rest = []
+    is_retest = False
     for tok in tokens:
+        if tok.lower() == "retest":
+            is_retest = True
+            continue
         m = READOUT_RE.match(tok)
         if m and readout_label is None:
             readout_value = float(m.group(1))
@@ -106,6 +110,8 @@ def parse_filename(path):
             "예: HTRB_Lot1_0hr, HTBG+_Lot2_500cyc (구분자는 _ 또는 공백)"
         )
     reliability = "_".join(rest).upper()
+    if is_retest:
+        reliability = "RETEST_" + reliability
     return reliability, lot, readout_label, readout_value
 
 
@@ -235,7 +241,9 @@ class DataModel:
         self.deleted = set()        # (group, readout, col, sample)
         self.color_over = {}        # (group, readout, col, sample) -> hex
         self.ylim = {}              # (group, col) -> (ymin, ymax)
-        self.ref_lines = {}         # (lot, col, kind) -> [ {axis,value,name,color} ]
+        self.limits = {}            # (group, col) -> {'high': v|None, 'low': v|None}
+        self.custom_lines = {}      # (group, col, kind) -> [ {axis,value,style,color,name} ]
+        self.texts = {}             # (group, col, kind) -> [ {text,x,y,size,color} ]
         self._undo = []
         self._redo = []
 
@@ -255,23 +263,28 @@ class DataModel:
                 errors.append(str(e))
                 continue
             rels.setdefault(rel, []).append(fname)
-            raw.setdefault(lot, []).append((rl, rv, cols, d, fname))
+            raw.setdefault((rel, lot), []).append((rl, rv, cols, d, fname))
 
         if not raw:
             return errors
 
-        # 한 번에 하나의 신뢰성만 분석 가능
-        if len(rels) > 1:
-            detail = "\n".join(f"  {r}: {', '.join(fs)}" for r, fs in rels.items())
+        # Retest_X와 X는 같은 신뢰성(별도 분석 단위). base가 다르면 차단
+        bases = {}
+        for r, fs in rels.items():
+            base = r[7:] if r.upper().startswith("RETEST_") else r
+            bases.setdefault(base, []).extend(fs)
+        if len(bases) > 1:
+            detail = "\n".join(f"  {b}: {', '.join(fs)}" for b, fs in bases.items())
             errors.append("한 번에 하나의 신뢰성만 분석할 수 있습니다.\n"
                           f"여러 신뢰성이 섞여 있습니다:\n{detail}")
             return errors
-        self.reliability = next(iter(rels))
+        self.reliability = next(iter(bases))
 
         self.groups = []
         self.g = {}
-        for group in sorted(raw):
-            entries = raw[group]
+        for rel_key, lot in sorted(raw):
+            group = lot if not rel_key.upper().startswith("RETEST_") else f"{lot}(R)"
+            entries = raw[(rel_key, lot)]
             # 동일 그룹 내 동일 Read-out 중복 → 오류로 안내 (덮어쓰기 방지)
             seen_ro = {}
             dup = []
@@ -313,17 +326,26 @@ class DataModel:
 
             self.groups.append(group)
             self.g[group] = dict(readouts=readouts, columns=col_union,
-                                 samples=sorted(samp_union), data=data)
+                                 samples=sorted(samp_union), data=data,
+                                 rel=rel_key, lot=lot)
 
         self.deleted.clear()
         self.color_over.clear()
         self.ylim.clear()
-        self.ref_lines.clear()
+        self.limits.clear()
+        self.custom_lines.clear()
+        self.texts.clear()
         self._undo.clear()
         self._redo.clear()
         return errors
 
     # ---- 그룹 속성 접근 -----------------------------------------------------
+    def group_rel(self, group):
+        return self.g[group].get("rel", self.reliability)
+
+    def group_lot(self, group):
+        return self.g[group].get("lot", group)
+
     def readouts(self, group):
         return self.g[group]["readouts"]
 
@@ -389,13 +411,27 @@ class DataModel:
                 self.ylim.pop(key, None)
             else:
                 self.ylim[key] = v
-        elif kind == "refline":
+        elif kind == "limits":
             _, key, old, new = action
             v = new if forward else old
             if not v:
-                self.ref_lines.pop(key, None)
+                self.limits.pop(key, None)
             else:
-                self.ref_lines[key] = v
+                self.limits[key] = v
+        elif kind == "cline":
+            _, key, old, new = action
+            v = new if forward else old
+            if not v:
+                self.custom_lines.pop(key, None)
+            else:
+                self.custom_lines[key] = v
+        elif kind == "text":
+            _, key, old, new = action
+            v = new if forward else old
+            if not v:
+                self.texts.pop(key, None)
+            else:
+                self.texts[key] = v
 
     def do(self, action):
         self._apply(action, True)
@@ -430,10 +466,25 @@ class DataModel:
         key = (group, readout, col, sample)
         self.do(("color", key, self.color_over.get(key), color))
 
-    def set_ref_lines(self, group, col, kind, lines):
+    def set_limits(self, group, col, high, low):
+        key = (group, col)
+        old = dict(self.limits.get(key, {}))
+        new = {}
+        if high is not None:
+            new["high"] = high
+        if low is not None:
+            new["low"] = low
+        self.do(("limits", key, old, new))
+
+    def set_custom_lines(self, group, col, kind, lines):
         key = (group, col, kind)
-        old = list(self.ref_lines.get(key, []))
-        self.do(("refline", key, old, list(lines)))
+        old = list(self.custom_lines.get(key, []))
+        self.do(("cline", key, old, list(lines)))
+
+    def set_texts(self, group, col, kind, texts):
+        key = (group, col, kind)
+        old = list(self.texts.get(key, []))
+        self.do(("text", key, old, list(texts)))
 
     def set_ylim(self, group, col, ymin, ymax):
         key = (group, col)
@@ -454,16 +505,13 @@ class DataModel:
 # ============================================================================
 # 4. 그래프 렌더링 (화면/PDF 공용 파이프라인) — 모두 (group, col) 단위
 # ============================================================================
-def draw_ref_lines(ax, model, group, col, kind):
-    """(점선) 임의 기준선 + 이름 표시.
-    1순위: 기준선 바로 윗부분 중 data/legend와 겹치지 않는 빈 구간에 표기.
-    회피 불가 시에만 빈 공간으로 이동하고 기준선과 실선으로 연결."""
-    lines = model.ref_lines.get((group, col, kind), [])
-    if not lines:
-        return
+LIMIT_COLOR = "#d62728"
+
+
+def _collect_pts(ax):
     pts_x, pts_y = [], []
     for ln in ax.get_lines():
-        if ln.get_marker() == "o":
+        if ln.get_marker() in ("o", "*"):
             for x, y in zip(ln.get_xdata(), ln.get_ydata()):
                 try:
                     if not math.isnan(float(y)):
@@ -471,88 +519,124 @@ def draw_ref_lines(ax, model, group, col, kind):
                         pts_y.append(float(y))
                 except (TypeError, ValueError):
                     pass
+    return pts_x, pts_y
+
+
+def _place_hline_label(ax, v, name, color, pts_x, pts_y, occupied):
+    """가로선 이름: 선 바로 위를 좌우로 훑어 data/기존 이름과 겹치지 않는 곳에.
+    실패 시 빈 공간 이동 + 연결선."""
     y0, y1 = ax.get_ylim()
     x0, x1 = ax.get_xlim()
     yr = (y1 - y0) or 1.0
     xr = (x1 - x0) or 1.0
-    has_legend = ax.get_legend() is not None
-
-    def in_legend_zone(xf, yf):
-        # legend는 loc='upper right' 고정 → 우상단 영역을 회피 구역으로 간주
-        return has_legend and xf > 0.58 and yf > 0.68
-
-    for rl in lines:
-        c = rl.get("color") or "red"
-        name = rl.get("name", "")
-        v = rl["value"]
-        if rl["axis"] == "y":
-            ax.axhline(v, color=c, ls=":", lw=1.2, zorder=4)
-            if not name:
+    dy = 0.05 * yr
+    ty = v + 0.010 * yr
+    est_w = 0.028 * xr * max(len(name), 1)  # 대략적 텍스트 폭
+    if 0.02 < (v - y0) / yr < 0.965:
+        for xf in [0.06, 0.16, 0.26, 0.36, 0.46, 0.56, 0.66, 0.76, 0.86]:
+            cx = x0 + xf * xr
+            box = (cx, cx + est_w, ty, ty + 0.06 * yr)
+            if any(not (box[1] < o[0] or box[0] > o[1] or
+                        box[3] < o[2] or box[2] > o[3]) for o in occupied):
                 continue
-            dy = 0.05 * yr
-            ty = v + 0.010 * yr           # 기준선 바로 위
-            yf = (ty - y0) / yr
-            placed = False
-            if 0.02 < (v - y0) / yr < 0.965:  # 선이 축 범위 안에 있을 때만
-                # 좌→우로 훑으며 빈 구간 탐색
-                for xf in [0.06, 0.16, 0.26, 0.36, 0.46, 0.56, 0.66, 0.76, 0.86]:
-                    cx = x0 + xf * xr
-                    if in_legend_zone(xf, yf + 0.05):
-                        continue
-                    crowded = any(abs(px - cx) < 0.07 * xr and
-                                  v - 0.5 * dy <= py <= v + 2.2 * dy
-                                  for px, py in zip(pts_x, pts_y))
-                    if not crowded:
-                        ax.text(cx, ty, name, ha="left", va="bottom",
-                                fontsize=7, color=c, zorder=6)
-                        placed = True
-                        break
-            if not placed:
-                # 회피 불가 → 빈 공간으로 이동 + 연결선
-                above = sum(1 for y in pts_y if v < y <= v + 2 * dy)
-                below = sum(1 for y in pts_y if v - 2 * dy <= y < v)
-                ty2 = v + 1.8 * dy if above <= below else v - 1.8 * dy
-                ty2 = min(max(ty2, y0 + 0.04 * yr), y1 - 0.04 * yr)
-                if has_legend:
-                    tx, anchor, ha = x0 + 0.02 * xr, x0 + 0.10 * xr, "left"
-                else:
-                    tx, anchor, ha = x1 - 0.02 * xr, x1 - 0.10 * xr, "right"
-                ax.annotate(name, xy=(anchor, v), xytext=(tx, ty2),
-                            ha=ha, va="center", fontsize=7, color=c, zorder=6,
-                            arrowprops=dict(arrowstyle="-", color=c,
-                                            lw=0.7, alpha=0.9))
+            crowded = any(abs(px - cx) < 0.07 * xr and
+                          v - 0.5 * dy <= py <= v + 2.2 * dy
+                          for px, py in zip(pts_x, pts_y))
+            if not crowded:
+                ax.text(cx, ty, name, ha="left", va="bottom",
+                        fontsize=7, color=color, zorder=6)
+                occupied.append(box)
+                return
+    # 폴백: 좌측 빈 공간 + 연결선
+    above = sum(1 for y in pts_y if v < y <= v + 2 * dy)
+    below = sum(1 for y in pts_y if v - 2 * dy <= y < v)
+    ty2 = v + 1.8 * dy if above <= below else v - 1.8 * dy
+    ty2 = min(max(ty2, y0 + 0.04 * yr), y1 - 0.04 * yr)
+    tx = x0 + 0.02 * xr
+    ax.annotate(name, xy=(x0 + 0.10 * xr, v), xytext=(tx, ty2),
+                ha="left", va="center", fontsize=7, color=color, zorder=6,
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.7, alpha=0.9))
+    occupied.append((tx, tx + est_w, ty2 - 0.03 * yr, ty2 + 0.03 * yr))
+
+
+def _place_vline_label(ax, v, name, color, pts_x, pts_y, occupied):
+    """세로선 이름: 선을 따라 상하로 훑어 겹치지 않는 곳에. 실패 시 이동+연결선."""
+    y0, y1 = ax.get_ylim()
+    x0, x1 = ax.get_xlim()
+    yr = (y1 - y0) or 1.0
+    xr = (x1 - x0) or 1.0
+    est_w = 0.028 * xr * max(len(name), 1)
+    for yf in [0.90, 0.78, 0.66, 0.54, 0.42, 0.30]:
+        cy = y0 + yf * yr
+        box = (v + 0.008 * xr, v + 0.008 * xr + est_w,
+               cy - 0.035 * yr, cy + 0.035 * yr)
+        if any(not (box[1] < o[0] or box[0] > o[1] or
+                    box[3] < o[2] or box[2] > o[3]) for o in occupied):
+            continue
+        crowded = any(abs(px - v) < 0.05 * xr and abs(py - cy) < 0.07 * yr
+                      for px, py in zip(pts_x, pts_y))
+        if not crowded:
+            ax.text(v + 0.008 * xr, cy, name, ha="left", va="center",
+                    fontsize=7, color=color, zorder=6)
+            occupied.append(box)
+            return
+    dx = 0.05 * xr
+    tx = min(max(v + 2 * dx, x0 + 0.04 * xr), x1 - 0.04 * xr)
+    ty = y1 - 0.12 * yr
+    ax.annotate(name, xy=(v, ty - 0.06 * yr), xytext=(tx, ty),
+                ha="center", va="bottom", fontsize=7, color=color, zorder=6,
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.7, alpha=0.9))
+    occupied.append((tx - est_w / 2, tx + est_w / 2, ty, ty + 0.06 * yr))
+
+
+def draw_overlays(ax, model, group, col, kind):
+    """High/Low limit(빨간 점선) + 임의의 선 + 임의 텍스트 렌더링.
+    이름들은 서로/데이터와 겹치지 않게 배치."""
+    pts_x, pts_y = _collect_pts(ax)
+    occupied = []
+    # 1) High/Low limit — Read-out('line')과 Box('box')에만 표시 (Delta 제외)
+    lim = model.limits.get((group, col), {})
+    if kind in ("line", "box") and lim:
+        for key, name in (("high", "High limit"), ("low", "Low limit")):
+            if lim.get(key) is None:
+                continue
+            v = lim[key]
+            ax.axhline(v, color=LIMIT_COLOR, ls=":", lw=1.2, zorder=4)
+            _place_hline_label(ax, v, name, LIMIT_COLOR, pts_x, pts_y, occupied)
+    # 2) 임의의 선
+    for cl in model.custom_lines.get((group, col, kind), []):
+        c = cl.get("color") or "#1f77b4"
+        st = cl.get("style", ":")
+        nm = cl.get("name", "")
+        v = cl["value"]
+        if cl["axis"] == "y":
+            ax.axhline(v, color=c, ls=st, lw=1.2, zorder=4)
+            if nm:
+                _place_hline_label(ax, v, nm, c, pts_x, pts_y, occupied)
         else:
-            ax.axvline(v, color=c, ls=":", lw=1.2, zorder=4)
-            if not name:
-                continue
-            vf = (v - x0) / xr
-            placed = False
-            # 세로 기준선의 "윗부분": 선을 따라 위에서부터 빈 자리 탐색
-            for yf in [0.90, 0.78, 0.66, 0.54, 0.42]:
-                cy = y0 + yf * yr
-                if in_legend_zone(vf, yf):
-                    continue
-                crowded = any(abs(px - v) < 0.05 * xr and
-                              abs(py - cy) < 0.07 * yr
-                              for px, py in zip(pts_x, pts_y))
-                if not crowded:
-                    ax.text(v + 0.008 * xr, cy, name, ha="left", va="center",
-                            fontsize=7, color=c, zorder=6)
-                    placed = True
-                    break
-            if not placed:
-                dx = 0.05 * xr
-                right = sum(1 for x, y in zip(pts_x, pts_y)
-                            if v < x <= v + 3 * dx and y > y1 - 0.3 * yr)
-                left = sum(1 for x, y in zip(pts_x, pts_y)
-                           if v - 3 * dx <= x < v and y > y1 - 0.3 * yr)
-                tx = v + 2 * dx if right <= left else v - 2 * dx
-                tx = min(max(tx, x0 + 0.04 * xr), x1 - 0.04 * xr)
-                ty = y1 - 0.40 * yr if in_legend_zone((tx - x0) / xr, 0.9) else y1 - 0.10 * yr
-                ax.annotate(name, xy=(v, ty - 0.06 * yr), xytext=(tx, ty),
-                            ha="center", va="bottom", fontsize=7, color=c,
-                            zorder=6, arrowprops=dict(arrowstyle="-", color=c,
-                                                      lw=0.7, alpha=0.9))
+            ax.axvline(v, color=c, ls=st, lw=1.2, zorder=4)
+            if nm:
+                _place_vline_label(ax, v, nm, c, pts_x, pts_y, occupied)
+    # 3) 임의 텍스트 (드래그 이동 지원 — GUI에서 picker 연결)
+    artists = []
+    for i, tx in enumerate(model.texts.get((group, col, kind), [])):
+        t = ax.text(tx["x"], tx["y"], tx["text"],
+                    fontsize=tx.get("size", 10), color=tx.get("color", "black"),
+                    fontfamily=["Arial", "DejaVu Sans"], zorder=7, picker=True)
+        t._user_text_index = i
+        t._user_text_kind = kind
+        artists.append(t)
+    return artists
+
+
+def limit_out(model, group, col, v):
+    """값 v가 High/Low limit 밖인지."""
+    lim = model.limits.get((group, col), {})
+    if not lim or v is None:
+        return False
+    hi = lim.get("high")
+    lo = lim.get("low")
+    return (hi is not None and v > hi) or (lo is not None and v < lo)
 
 
 def readout_color(model, group, readout):
@@ -570,26 +654,44 @@ def _apply_x_axis(ax, model, group):
 
 
 def graph_title(model, group, col):
-    """제목 형식: 신뢰성: LOT번호, ITEM [단위] @조건"""
-    return f"{model.reliability}: {group}, {col_title(col)}"
+    """제목 형식: 신뢰성: LOT번호, ITEM [단위] @조건 (Retest면 RETEST_ 접두)"""
+    return f"{model.group_rel(group)}: {model.group_lot(group)}, {col_title(col)}"
 
 
 def draw_line(ax, model, group, col, picker=False, screen=False):
-    """Read-out graph: X=Sample(짝수 Label/홀수 Minor Tick), Read-out별 색상."""
+    """Read-out graph: X=Sample(짝수 Label/홀수 Minor Tick), Read-out별 색상.
+    limit 밖 data는 원래 색 유지 + 굵은 * 마커."""
     artists = {}
+    base_ms = 4
     for r in model.readouts(group):
         c = readout_color(model, group, r)
         xs, ys = model.series(group, r, col)
-        kw = dict(marker="o", ms=4, lw=1, color=c, label=r)
+        kw = dict(lw=1, color=c, label=r)
         if picker:
             kw["picker"] = 5
         line, = ax.plot(xs, ys, **kw)
         artists[r] = line
+        in_x, in_y, out_x, out_y = [], [], [], []
+        for x, v in zip(xs, ys):
+            if math.isnan(v):
+                continue
+            if limit_out(model, group, col, v):
+                out_x.append(x)
+                out_y.append(v)
+            else:
+                in_x.append(x)
+                in_y.append(v)
+        ax.plot(in_x, in_y, marker="o", ms=base_ms, ls="none", color=c)
+        if out_x:
+            ax.plot(out_x, out_y, marker="*", ms=base_ms + 3, mew=1.1,
+                    ls="none", color=c, zorder=4)
         for s, v in zip(xs, ys):
             oc = model.color_over.get((group, r, col, s))
             if oc and not math.isnan(v):
-                ax.plot([s], [v], marker="^", ms=5, color=oc, markeredgecolor="black", markeredgewidth=0.6, ls="none", zorder=5)
-    ax.set_title(graph_title(model, group, col), fontsize=9)
+                ax.plot([s], [v], marker="^", ms=6, color=oc,
+                        markeredgecolor="black", markeredgewidth=0.6,
+                        ls="none", zorder=5)
+    ax.set_title(graph_title(model, group, col), fontsize=9, loc="left")
     ax.set_xlabel("Sample No.", fontsize=8)
     mu = re.search(r"\(([^()]*)\)\s*(?:#\d+)?$", col)
     unit = f" ({mu.group(1)})" if mu else ""
@@ -612,37 +714,59 @@ def draw_line(ax, model, group, col, picker=False, screen=False):
             ax.set_ylim(0, vmax * 1.10)
         else:
             ax.set_ylim(bottom=0)
-    ax.legend(fontsize=9 if screen else 6, ncol=2, loc="upper right")
-    draw_ref_lines(ax, model, group, col, "line")
+    # legend: 축 바깥 위쪽 가로 배치 → 그래프와 겹치지 않음
+    ax.legend(fontsize=9 if screen else 6,
+              ncol=max(1, len(model.readouts(group))),
+              loc="lower right", bbox_to_anchor=(1.0, 1.0),
+              borderaxespad=0.0, frameon=True, handletextpad=0.4,
+              columnspacing=0.8)
+    text_artists = draw_overlays(ax, model, group, col, "line")
     ax.grid(True, alpha=0.3)
+    artists["__texts__"] = text_artists
     return artists
 
 
 def delta_title(model, group, col):
     """Delta 제목: 단위 위치에 일괄 [%] 적용."""
-    t = f"{model.reliability}: {group}, {col_title(col)}"
+    t = f"{model.group_rel(group)}: {model.group_lot(group)}, {col_title(col)}"
     return re.sub(r"\[[^\[\]]*\]", "[%]", t, count=1)
 
 
-def draw_delta(ax, model, group, col, screen=False):
+def draw_delta(ax, model, group, col, screen=False, picker=False):
     """Delta % graph: 초기 Read-out 기준 변화율. layout은 Read-out graph와 동일."""
+    artists = {}
     for r in model.readouts(group)[1:]:
         c = readout_color(model, group, r)
         xs, ys = model.delta_series(group, r, col)
-        ax.plot(xs, ys, marker="o", ms=4, lw=1, color=c, label=r)
+        kw = dict(marker="o", ms=4, lw=1, color=c, label=r)
+        if picker:
+            kw["picker"] = 5
+        line, = ax.plot(xs, ys, **kw)
+        artists[r] = line
         for s, v in zip(xs, ys):
             oc = model.color_over.get((group, r, col, s))
             if oc and not math.isnan(v):
-                ax.plot([s], [v], marker="^", ms=5, color=oc, markeredgecolor="black", markeredgewidth=0.6, ls="none", zorder=5)
-    ax.set_title(delta_title(model, group, col), fontsize=9)
+                ax.plot([s], [v], marker="^", ms=6, color=oc,
+                        markeredgecolor="black", markeredgewidth=0.6,
+                        ls="none", zorder=5)
+    ax.set_title(delta_title(model, group, col), fontsize=9, loc="left")
     ax.set_xlabel("Sample No.", fontsize=8)
     ax.set_ylabel("Delta (%)", fontsize=8)
     _apply_x_axis(ax, model, group)
     ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.7)
     if len(model.readouts(group)) > 1:
-        ax.legend(fontsize=9 if screen else 6, ncol=2, loc="upper right")
-    draw_ref_lines(ax, model, group, col, "delta")
+        ax.legend(fontsize=9 if screen else 6,
+                  ncol=max(1, len(model.readouts(group)) - 1),
+                  loc="lower right", bbox_to_anchor=(1.0, 1.0),
+                  borderaxespad=0.0, frameon=True, handletextpad=0.4,
+                  columnspacing=0.8)
+    else:
+        ax.text(0.5, 0.5, "Read-out 1개 — Delta 없음", transform=ax.transAxes,
+                ha="center", va="center", fontsize=9, color="gray")
+    text_artists = draw_overlays(ax, model, group, col, "delta")
     ax.grid(True, alpha=0.3)
+    artists["__texts__"] = text_artists
+    return artists
 
 
 def draw_box(ax, model, group, col, picker=False, stats_table=True):
@@ -661,24 +785,39 @@ def draw_box(ax, model, group, col, picker=False, stats_table=True):
         c = readout_color(model, group, r)
         patch.set_facecolor(c)
         patch.set_alpha(0.5)
-    for fl, r in zip(bp["fliers"], readouts):
-        fl.set(marker="o", markerfacecolor=readout_color(model, group, r),
+    star_artists = []
+    for i, (fl, r) in enumerate(zip(bp["fliers"], readouts)):
+        c = readout_color(model, group, r)
+        yd = list(fl.get_ydata())
+        in_l = [y for y in yd if not limit_out(model, group, col, y)]
+        out_l = [y for y in yd if limit_out(model, group, col, y)]
+        fl.set_xdata([i + 1] * len(in_l))
+        fl.set_ydata(in_l)
+        fl.set(marker="o", markerfacecolor=c,
                markeredgecolor="black", markersize=3)
         if picker:
             fl.set_picker(5)
+        if out_l:  # limit 밖 outlier는 굵은 * (원래 색 유지)
+            st, = ax.plot([i + 1] * len(out_l), out_l, marker="*", ms=6,
+                          mew=1.1, ls="none", color=c, zorder=4)
+            if picker:
+                st.set_picker(5)
+            st._star_readout = r
+            star_artists.append(st)
     # 색 변경된 점은 삼각형으로 해당 Read-out 위치에 표시 (Line과 동일 규칙)
     for (gr, r, c, s), oc in model.color_over.items():
         if gr != group or c != col:
             continue
         v = model.value(group, r, c, s)
         if v is not None and r in readouts:
-            ax.plot([readouts.index(r) + 1], [v], marker="^", ms=5,
-                    color=oc, ls="none", zorder=5)
-    ax.set_title(graph_title(model, group, col), fontsize=9)
+            ax.plot([readouts.index(r) + 1], [v], marker="^", ms=6,
+                    color=oc, markeredgecolor="black", markeredgewidth=0.6,
+                    ls="none", zorder=5)
+    ax.set_title(graph_title(model, group, col), fontsize=9, loc="left")
     ax.tick_params(labelsize=7)
     if (group, col) in model.ylim:
         ax.set_ylim(*model.ylim[(group, col)])
-    draw_ref_lines(ax, model, group, col, "box")
+    text_artists = draw_overlays(ax, model, group, col, "box")
     ax.grid(True, alpha=0.3)
 
     if stats_table:
@@ -686,7 +825,7 @@ def draw_box(ax, model, group, col, picker=False, stats_table=True):
         # 어떤 페이지 layout에서도 라벨/통계 겹침이 발생하지 않도록 함
         trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
         ax.tick_params(axis="x", labelbottom=False)
-        y0, dy, fs = -0.07, 0.075, 8
+        y0, dy, fs = -0.145, 0.075, 7
         for i, r in enumerate(readouts):
             ax.text(i + 1, y0, r, transform=trans,
                     ha="center", va="center", fontsize=fs, fontweight="bold")
@@ -704,6 +843,8 @@ def draw_box(ax, model, group, col, picker=False, stats_table=True):
                         ha="center", va="center", fontsize=fs)
     else:
         ax.set_xlabel("Read-out", fontsize=8)
+    bp["stars"] = star_artists
+    bp["texts"] = text_artists
     return bp
 
 
@@ -729,7 +870,7 @@ def export_pdf(model, pairs, path, progress_cb=None):
     with PdfPages(path) as pdf:
         for g in order:
             cols = per_group[g]
-            head = f"{model.reliability}: {g}"
+            head = f"{model.group_rel(g)}: {model.group_lot(g)}"
             # 1) item별 Read-out + Delta % 쌍 — 1페이지 1줄 1개 x 4줄 (item 2개분)
             for i in range(0, len(cols), 2):
                 fig = Figure(figsize=PPT_LANDSCAPE)
@@ -920,7 +1061,9 @@ class App(BaseTk):
         ttk.Button(top, text="다음 ▶", command=lambda: self._nav(1)).pack(side="left", padx=3)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(top, text="Y축 Min/Max", command=self._set_ylim).pack(side="left", padx=3)
-        ttk.Button(top, text="기준선", command=self._ref_line_dialog).pack(side="left", padx=3)
+        ttk.Button(top, text="Limit", command=self._limit_dialog).pack(side="left", padx=3)
+        ttk.Button(top, text="임의선", command=self._custom_line_dialog).pack(side="left", padx=3)
+        ttk.Button(top, text="텍스트", command=self._text_dialog).pack(side="left", padx=3)
         ttk.Button(top, text="Undo", command=self._undo).pack(side="left", padx=3)
         ttk.Button(top, text="Redo", command=self._redo).pack(side="left", padx=3)
         ttk.Button(top, text="Export PDF", command=self._export_pdf).pack(side="right", padx=3)
@@ -928,23 +1071,18 @@ class App(BaseTk):
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True)
-        self.line_tab = ttk.Frame(self.nb)
-        self.delta_tab = ttk.Frame(self.nb)
+        self.line_tab = ttk.Frame(self.nb)   # Read-out(위) + Delta %(아래) 통합 탭
         self.box_tab = ttk.Frame(self.nb)
-        self.nb.add(self.line_tab, text="Read-out graph")
-        self.nb.add(self.delta_tab, text="Delta % graph")
+        self.nb.add(self.line_tab, text="Read-out & Delta % graph")
         self.nb.add(self.box_tab, text="Box plot")
 
-        self.line_fig = Figure(figsize=(10, 5))
+        self.line_fig = Figure(figsize=(10, 7))
         self.line_canvas = FigureCanvasTkAgg(self.line_fig, self.line_tab)
         self.line_canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self.line_canvas, self.line_tab)
         self.line_canvas.mpl_connect("pick_event", self._on_pick_line)
-
-        self.delta_fig = Figure(figsize=(10, 5))
-        self.delta_canvas = FigureCanvasTkAgg(self.delta_fig, self.delta_tab)
-        self.delta_canvas.get_tk_widget().pack(fill="both", expand=True)
-        NavigationToolbar2Tk(self.delta_canvas, self.delta_tab)
+        self.line_canvas.mpl_connect("motion_notify_event", self._on_text_motion)
+        self.line_canvas.mpl_connect("button_release_event", self._on_text_release)
 
         ctrl = ttk.Frame(self.box_tab)
         ctrl.pack(fill="x")
@@ -960,6 +1098,8 @@ class App(BaseTk):
         self.box_canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self.box_canvas, self.box_tab)
         self.box_canvas.mpl_connect("pick_event", self._on_pick_box)
+        self.box_canvas.mpl_connect("motion_notify_event", self._on_text_motion)
+        self.box_canvas.mpl_connect("button_release_event", self._on_text_release)
 
         self._goto(0)
 
@@ -975,6 +1115,7 @@ class App(BaseTk):
 
     def _goto(self, idx):
         self.cur_idx = idx
+        self._sel_point = None
         group, col = self.selected[idx]
         same_group = [p for p in self.selected if p[0] == group]
         self.box_page = same_group.index((group, col)) // 4
@@ -985,16 +1126,32 @@ class App(BaseTk):
         group, col = self.selected[self.cur_idx]
 
         self.line_fig.clear()
-        ax = self.line_fig.add_subplot(111)
-        self._line_artists = draw_line(ax, self.model, group, col, picker=True, screen=True)
+        self._drag_text = None
+        ax = self.line_fig.add_subplot(2, 1, 1)
+        self._line_artists = draw_line(ax, self.model, group, col,
+                                       picker=True, screen=True)
+        axd = self.line_fig.add_subplot(2, 1, 2)
+        self._delta_artists = draw_delta(axd, self.model, group, col,
+                                         screen=True, picker=True)
+        self._ax_line, self._ax_delta = ax, axd
+        # 선택 강조: 양쪽 그래프에서 동일 data 마커 표시
+        sel = getattr(self, "_sel_point", None)
+        if sel is not None:
+            s_r, s_s = sel
+            # Read-out 그래프
+            v = self.model.value(group, s_r, col, s_s)
+            if v is not None:
+                ax.plot([s_s], [v], marker="o", ms=10, mfc="none",
+                        mec="#ff9900", mew=1.8, ls="none", zorder=8)
+            # Delta 그래프 (기준 read-out은 delta에 없음)
+            if s_r != self.model.readouts(group)[0]:
+                xs, ys = self.model.delta_series(group, s_r, col)
+                for x, dv in zip(xs, ys):
+                    if x == s_s and not math.isnan(dv):
+                        axd.plot([x], [dv], marker="o", ms=10, mfc="none",
+                                 mec="#ff9900", mew=1.8, ls="none", zorder=8)
         self.line_fig.tight_layout()
         self.line_canvas.draw()
-
-        self.delta_fig.clear()
-        axd = self.delta_fig.add_subplot(111)
-        draw_delta(axd, self.model, group, col, screen=True)
-        self.delta_fig.tight_layout()
-        self.delta_canvas.draw()
 
         self._redraw_box()
 
@@ -1022,6 +1179,8 @@ class App(BaseTk):
             bp = draw_box(ax2, self.model, g2, c2, picker=True, stats_table=True)
             for fl, r in zip(bp["fliers"], self.model.readouts(g2)):
                 self._box_fliers[fl] = (g2, r, c2)
+            for st in bp.get("stars", []):
+                self._box_fliers[st] = (g2, st._star_readout, c2)
             if c2 == col:
                 ax2.set_title(graph_title(self.model, g2, c2),
                               fontsize=9, fontweight="bold")
@@ -1031,19 +1190,57 @@ class App(BaseTk):
 
     # ---- 편집 --------------------------------------------------------------
     def _on_pick_line(self, event):
+        # 텍스트 드래그 시작
+        if hasattr(event.artist, "_user_text_index"):
+            self._drag_text = event.artist
+            self._drag_kind = event.artist._user_text_kind
+            return
         group, col = self.selected[self.cur_idx]
         artist = event.artist
         readout = None
-        for r, ln in self._line_artists.items():
-            if ln is artist:
-                readout = r
+        for d in (getattr(self, "_line_artists", {}) or {},
+                  getattr(self, "_delta_artists", {}) or {}):
+            for r, ln in d.items():
+                if r != "__texts__" and ln is artist:
+                    readout = r
+                    break
+            if readout:
                 break
         if readout is None or not len(event.ind):
             return
         sample = self.model.samples(group)[event.ind[0]]
+        self._sel_point = (readout, sample)
+        self._redraw()  # 양쪽 그래프 동일 마커 강조
         self._point_menu(group, readout, col, sample)
 
+    def _on_text_motion(self, event):
+        t = getattr(self, "_drag_text", None)
+        if t is None or event.xdata is None or event.ydata is None:
+            return
+        t.set_position((event.xdata, event.ydata))
+        t.figure.canvas.draw_idle()
+
+    def _on_text_release(self, event):
+        t = getattr(self, "_drag_text", None)
+        if t is None:
+            return
+        self._drag_text = None
+        if event.xdata is None or event.ydata is None:
+            return
+        group, col = self.selected[self.cur_idx]
+        kind = self._drag_kind
+        texts = list(self.model.texts.get((group, col, kind), []))
+        i = t._user_text_index
+        if 0 <= i < len(texts):
+            texts[i] = dict(texts[i], x=float(event.xdata), y=float(event.ydata))
+            self.model.set_texts(group, col, kind, texts)
+        self._redraw()
+
     def _on_pick_box(self, event):
+        if hasattr(event.artist, "_user_text_index"):
+            self._drag_text = event.artist
+            self._drag_kind = event.artist._user_text_kind
+            return
         info = getattr(self, "_box_fliers", {}).get(event.artist)
         if info is None or not len(event.ind):
             return
@@ -1125,38 +1322,91 @@ class App(BaseTk):
         ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left", padx=5)
         center_window(dlg)
 
-    def _ref_line_dialog(self):
+    def _limit_dialog(self):
+        """High/Low limit: 값만 입력. 이름/색(빨강 점선)은 고정."""
+        group, col = self.selected[self.cur_idx]
+        cur = self.model.limits.get((group, col), {})
+        dlg = tk.Toplevel(self)
+        dlg.title("High/Low Limit")
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text=self._label((group, col)), font=("", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, padx=10, pady=(10, 5))
+        ttk.Label(dlg, text="High limit:").grid(row=1, column=0, sticky="e", padx=5)
+        vh = tk.StringVar(value="" if cur.get("high") is None else str(cur["high"]))
+        ttk.Entry(dlg, textvariable=vh, width=14).grid(row=1, column=1, padx=10, pady=3)
+        ttk.Label(dlg, text="Low limit:").grid(row=2, column=0, sticky="e", padx=5)
+        vl = tk.StringVar(value="" if cur.get("low") is None else str(cur["low"]))
+        ttk.Entry(dlg, textvariable=vl, width=14).grid(row=2, column=1, padx=10, pady=3)
+        ttk.Label(dlg, text="※ 빈칸이면 해당 limit 없음\n"
+                            "※ limit 밖 data는 * 마커로 표시됩니다",
+                  foreground="gray").grid(row=3, column=0, columnspan=2, pady=3)
+
+        def apply():
+            def parse(sv):
+                t = sv.get().strip()
+                if not t:
+                    return None
+                return float(t)
+            try:
+                hi, lo = parse(vh), parse(vl)
+            except ValueError:
+                messagebox.showwarning("알림", "숫자를 입력하세요.", parent=dlg)
+                return
+            if hi is not None and lo is not None and hi <= lo:
+                messagebox.showwarning("알림", "High limit는 Low limit보다 커야 합니다.",
+                                       parent=dlg)
+                return
+            self.model.set_limits(group, col, hi, lo)
+            dlg.destroy()
+            self._redraw()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=4, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text="적용", command=apply).pack(side="left", padx=5)
+        ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left", padx=5)
+        center_window(dlg)
+
+    STYLES = [("실선", "-"), ("점선", ":"), ("파선", "--"), ("일점쇄선", "-.")]
+
+    def _custom_line_dialog(self):
+        """임의의 선: X/Y축, 값, 모양, 색, 이름(선택). 수정/삭제 가능."""
         group, col = self.selected[self.cur_idx]
         kinds = [("Read-out graph", "line"), ("Delta % graph", "delta"), ("Box plot", "box")]
         try:
             cur_tab = self.nb.index(self.nb.select())
         except Exception:
             cur_tab = 0
+        # 통합 탭(0)이면 기본 line, Box 탭(1)이면 box
+        kind_default = 0 if cur_tab == 0 else 2
 
         dlg = tk.Toplevel(self)
-        dlg.title("기준선 관리")
+        dlg.title("임의의 선 관리")
         dlg.transient(self)
         dlg.grab_set()
         ttk.Label(dlg, text=self._label((group, col)), font=("", 9, "bold")).grid(
             row=0, column=0, columnspan=4, padx=10, pady=(10, 5))
-
         ttk.Label(dlg, text="대상 그래프:").grid(row=1, column=0, sticky="e", padx=5)
         kind_cb = ttk.Combobox(dlg, state="readonly", width=16,
                                values=[k[0] for k in kinds])
-        kind_cb.current(min(cur_tab, 2))
+        kind_cb.current(kind_default)
         kind_cb.grid(row=1, column=1, columnspan=3, sticky="w", pady=2)
 
-        lb = tk.Listbox(dlg, height=5, width=48)
+        lb = tk.Listbox(dlg, height=5, width=52)
         lb.grid(row=2, column=0, columnspan=4, padx=10, pady=5)
 
         def cur_kind():
             return kinds[kind_cb.current()][1]
 
+        def cur_lines():
+            return list(self.model.custom_lines.get((group, col, cur_kind()), []))
+
         def refresh():
             lb.delete(0, "end")
-            for rl in self.model.ref_lines.get((group, col, cur_kind()), []):
-                lb.insert("end", f"[{rl['axis'].upper()}={rl['value']}] "
-                                 f"{rl['name']}  ({rl['color']})")
+            for cl in cur_lines():
+                style_name = next((n for n, s in self.STYLES if s == cl.get("style")), "?")
+                lb.insert("end", f"[{cl['axis'].upper()}={cl['value']}] "
+                                 f"{cl.get('name','')} {style_name} ({cl.get('color')})")
         kind_cb.bind("<<ComboboxSelected>>", lambda e: refresh())
 
         ttk.Label(dlg, text="축:").grid(row=3, column=0, sticky="e", padx=5)
@@ -1166,31 +1416,71 @@ class App(BaseTk):
         ttk.Label(dlg, text="값:").grid(row=3, column=2, sticky="e", padx=5)
         val_var = tk.StringVar()
         ttk.Entry(dlg, textvariable=val_var, width=10).grid(row=3, column=3, sticky="w")
-        ttk.Label(dlg, text="이름:").grid(row=4, column=0, sticky="e", padx=5)
-        name_var = tk.StringVar(value="High limit")
-        ttk.Entry(dlg, textvariable=name_var, width=14).grid(row=4, column=1, sticky="w")
-        color_var = tk.StringVar(value="#d62728")
+        ttk.Label(dlg, text="모양:").grid(row=4, column=0, sticky="e", padx=5)
+        style_cb = ttk.Combobox(dlg, state="readonly", width=8,
+                                values=[n for n, _ in self.STYLES])
+        style_cb.current(1)
+        style_cb.grid(row=4, column=1, sticky="w")
+        ttk.Label(dlg, text="이름(선택):").grid(row=4, column=2, sticky="e", padx=5)
+        name_var = tk.StringVar()
+        ttk.Entry(dlg, textvariable=name_var, width=12).grid(row=4, column=3, sticky="w")
+        color_var = tk.StringVar(value="#1f77b4")
         color_btn = tk.Button(dlg, text="색 선택", bg=color_var.get(), width=8,
-                              command=lambda: _pick_color())
-        color_btn.grid(row=4, column=2, columnspan=2, sticky="w", padx=5)
+                              command=lambda: _pick())
+        color_btn.grid(row=5, column=0, columnspan=2, sticky="e", padx=5, pady=3)
 
-        def _pick_color():
+        def _pick():
             c = colorchooser.askcolor(color=color_var.get(), parent=dlg)[1]
             if c:
                 color_var.set(c)
                 color_btn.config(bg=c)
 
-        def add():
+        def make_item():
             try:
                 v = float(val_var.get())
             except ValueError:
                 messagebox.showwarning("알림", "값에 숫자를 입력하세요.", parent=dlg)
+                return None
+            return dict(axis=axis_cb.get().lower(), value=v,
+                        style=self.STYLES[style_cb.current()][1],
+                        color=color_var.get(), name=name_var.get().strip())
+
+        def add():
+            it = make_item()
+            if it is None:
                 return
-            k = cur_kind()
-            lines = list(self.model.ref_lines.get((group, col, k), []))
-            lines.append(dict(axis=axis_cb.get().lower(), value=v,
-                              name=name_var.get().strip(), color=color_var.get()))
-            self.model.set_ref_lines(group, col, k, lines)
+            lines = cur_lines()
+            lines.append(it)
+            self.model.set_custom_lines(group, col, cur_kind(), lines)
+            refresh()
+            self._redraw()
+
+        def load_sel(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            cl = cur_lines()[sel[0]]
+            axis_cb.current(0 if cl["axis"] == "y" else 1)
+            val_var.set(str(cl["value"]))
+            idx = next((i for i, (n, s) in enumerate(self.STYLES)
+                        if s == cl.get("style")), 1)
+            style_cb.current(idx)
+            name_var.set(cl.get("name", ""))
+            color_var.set(cl.get("color", "#1f77b4"))
+            color_btn.config(bg=color_var.get())
+        lb.bind("<<ListboxSelect>>", load_sel)
+
+        def modify():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("알림", "수정할 선을 목록에서 선택하세요.", parent=dlg)
+                return
+            it = make_item()
+            if it is None:
+                return
+            lines = cur_lines()
+            lines[sel[0]] = it
+            self.model.set_custom_lines(group, col, cur_kind(), lines)
             refresh()
             self._redraw()
 
@@ -1198,18 +1488,152 @@ class App(BaseTk):
             sel = lb.curselection()
             if not sel:
                 return
-            k = cur_kind()
-            lines = list(self.model.ref_lines.get((group, col, k), []))
+            lines = cur_lines()
             del lines[sel[0]]
-            self.model.set_ref_lines(group, col, k, lines)
+            self.model.set_custom_lines(group, col, cur_kind(), lines)
+            refresh()
+            self._redraw()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=6, column=0, columnspan=4, pady=10)
+        ttk.Button(btns, text="추가", command=add).pack(side="left", padx=4)
+        ttk.Button(btns, text="선택 수정", command=modify).pack(side="left", padx=4)
+        ttk.Button(btns, text="선택 삭제", command=remove).pack(side="left", padx=4)
+        ttk.Button(btns, text="닫기", command=dlg.destroy).pack(side="left", padx=4)
+        refresh()
+        center_window(dlg)
+
+    def _text_dialog(self):
+        """임의 텍스트: 내용/크기/색. 추가 후 그래프에서 드래그로 이동."""
+        group, col = self.selected[self.cur_idx]
+        kinds = [("Read-out graph", "line"), ("Delta % graph", "delta"), ("Box plot", "box")]
+        try:
+            cur_tab = self.nb.index(self.nb.select())
+        except Exception:
+            cur_tab = 0
+        kind_default = 0 if cur_tab == 0 else 2
+
+        dlg = tk.Toplevel(self)
+        dlg.title("텍스트 관리")
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text=self._label((group, col)), font=("", 9, "bold")).grid(
+            row=0, column=0, columnspan=4, padx=10, pady=(10, 5))
+        ttk.Label(dlg, text="대상 그래프:").grid(row=1, column=0, sticky="e", padx=5)
+        kind_cb = ttk.Combobox(dlg, state="readonly", width=16,
+                               values=[k[0] for k in kinds])
+        kind_cb.current(kind_default)
+        kind_cb.grid(row=1, column=1, columnspan=3, sticky="w", pady=2)
+
+        lb = tk.Listbox(dlg, height=5, width=52)
+        lb.grid(row=2, column=0, columnspan=4, padx=10, pady=5)
+
+        def cur_kind():
+            return kinds[kind_cb.current()][1]
+
+        def cur_texts():
+            return list(self.model.texts.get((group, col, cur_kind()), []))
+
+        def refresh():
+            lb.delete(0, "end")
+            for t in cur_texts():
+                lb.insert("end", f"'{t['text']}'  size={t.get('size',10)} "
+                                 f"({t.get('color','black')})")
+        kind_cb.bind("<<ComboboxSelected>>", lambda e: refresh())
+
+        ttk.Label(dlg, text="내용:").grid(row=3, column=0, sticky="e", padx=5)
+        txt_var = tk.StringVar()
+        ttk.Entry(dlg, textvariable=txt_var, width=28).grid(
+            row=3, column=1, columnspan=3, sticky="w", pady=3)
+        ttk.Label(dlg, text="크기:").grid(row=4, column=0, sticky="e", padx=5)
+        size_var = tk.StringVar(value="10")
+        ttk.Entry(dlg, textvariable=size_var, width=6).grid(row=4, column=1, sticky="w")
+        color_var = tk.StringVar(value="#000000")
+        color_btn = tk.Button(dlg, text="색 선택", bg=color_var.get(), width=8,
+                              command=lambda: _pick())
+        color_btn.grid(row=4, column=2, columnspan=2, sticky="w", padx=5)
+
+        def _pick():
+            c = colorchooser.askcolor(color=color_var.get(), parent=dlg)[1]
+            if c:
+                color_var.set(c)
+                color_btn.config(bg=c)
+
+        def make_item(base=None):
+            try:
+                size = float(size_var.get())
+            except ValueError:
+                messagebox.showwarning("알림", "크기에 숫자를 입력하세요.", parent=dlg)
+                return None
+            if not txt_var.get().strip():
+                messagebox.showwarning("알림", "내용을 입력하세요.", parent=dlg)
+                return None
+            it = dict(base or {})
+            it.update(text=txt_var.get(), size=size, color=color_var.get())
+            return it
+
+        def add():
+            # 초기 위치: 그래프 중앙 (이후 드래그로 이동)
+            ax = self._ax_line if cur_kind() == "line" else (
+                self._ax_delta if cur_kind() == "delta" else None)
+            if ax is not None:
+                x0, x1 = ax.get_xlim()
+                y0, y1 = ax.get_ylim()
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            else:
+                cx, cy = 0.5, 0.5
+            it = make_item({"x": cx, "y": cy})
+            if it is None:
+                return
+            texts = cur_texts()
+            texts.append(it)
+            self.model.set_texts(group, col, cur_kind(), texts)
+            refresh()
+            self._redraw()
+
+        def load_sel(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            t = cur_texts()[sel[0]]
+            txt_var.set(t["text"])
+            size_var.set(str(t.get("size", 10)))
+            color_var.set(t.get("color", "#000000"))
+            color_btn.config(bg=color_var.get())
+        lb.bind("<<ListboxSelect>>", load_sel)
+
+        def modify():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("알림", "수정할 텍스트를 선택하세요.", parent=dlg)
+                return
+            texts = cur_texts()
+            it = make_item(texts[sel[0]])
+            if it is None:
+                return
+            texts[sel[0]] = it
+            self.model.set_texts(group, col, cur_kind(), texts)
+            refresh()
+            self._redraw()
+
+        def remove():
+            sel = lb.curselection()
+            if not sel:
+                return
+            texts = cur_texts()
+            del texts[sel[0]]
+            self.model.set_texts(group, col, cur_kind(), texts)
             refresh()
             self._redraw()
 
         btns = ttk.Frame(dlg)
         btns.grid(row=5, column=0, columnspan=4, pady=10)
-        ttk.Button(btns, text="추가", command=add).pack(side="left", padx=5)
-        ttk.Button(btns, text="선택 삭제", command=remove).pack(side="left", padx=5)
-        ttk.Button(btns, text="닫기", command=dlg.destroy).pack(side="left", padx=5)
+        ttk.Button(btns, text="추가", command=add).pack(side="left", padx=4)
+        ttk.Button(btns, text="선택 수정", command=modify).pack(side="left", padx=4)
+        ttk.Button(btns, text="선택 삭제", command=remove).pack(side="left", padx=4)
+        ttk.Button(btns, text="닫기", command=dlg.destroy).pack(side="left", padx=4)
+        ttk.Label(dlg, text="※ 추가 후 그래프에서 텍스트를 드래그해 위치를 옮길 수 있습니다",
+                  foreground="gray").grid(row=6, column=0, columnspan=4, pady=(0, 8))
         refresh()
         center_window(dlg)
 
