@@ -1,12 +1,9 @@
-name: Build Windows EXE
+name: Build EXE
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -19,46 +16,21 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          pip install matplotlib openpyxl tkinterdnd2 pyinstaller
+        run: pip install matplotlib openpyxl tkinterdnd2 pyinstaller pillow
 
-      - name: Build EXE (size-optimized)
+      - name: Build EXE (logo.png 내장)
         run: >
-          pyinstaller --onefile --windowed --name ReliabilityAnalyzer
+          pyinstaller --onefile --windowed
+          --add-data "logo.png;."
           --collect-all tkinterdnd2
-          --exclude-module pandas
-          --exclude-module scipy
-          --exclude-module PIL.ImageQt
-          --exclude-module PyQt5
-          --exclude-module PyQt6
-          --exclude-module PySide2
-          --exclude-module PySide6
-          --exclude-module IPython
-          --exclude-module pytest
-          --exclude-module matplotlib.tests
-          --exclude-module numpy.tests
+          --name ReliabilityAnalyzer
           reliability_analyzer.py
 
-      - name: Report EXE size
-        shell: pwsh
-        run: |
-          $f = Get-Item dist/ReliabilityAnalyzer.exe
-          $mb = [math]::Round($f.Length / 1MB, 1)
-          echo "EXE size: $mb MB"
-          if ($mb -gt 50) { echo "::warning::EXE exceeds 50MB target ($mb MB)" }
+      - name: Zip
+        run: Compress-Archive -Path dist/ReliabilityAnalyzer.exe -DestinationPath ReliabilityAnalyzer.zip
 
-      - name: Create ZIP
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist/ReliabilityAnalyzer.exe -DestinationPath ReliabilityAnalyzer.zip -Force
-          $z = Get-Item ReliabilityAnalyzer.zip
-          echo ("ZIP size: " + [math]::Round($z.Length / 1MB, 1) + " MB")
-
-      - name: Upload to Release
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest Build
+          tag_name: build-${{ github.run_number }}
           files: ReliabilityAnalyzer.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
