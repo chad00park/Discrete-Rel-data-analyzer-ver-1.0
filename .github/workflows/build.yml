@@ -18,10 +18,9 @@ jobs:
       - name: Install dependencies
         run: pip install matplotlib openpyxl tkinterdnd2 pyinstaller pillow
 
-      - name: Build EXE (logo.png 내장)
+      - name: Build EXE
         run: >
           pyinstaller --onefile --windowed
-          --add-data "logo.png;."
           --collect-all tkinterdnd2
           --name ReliabilityAnalyzer
           reliability_analyzer.py
